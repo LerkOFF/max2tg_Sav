@@ -1,0 +1,37 @@
+#!/bin/zsh
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT_DIR"
+
+PID_FILE="data/bot.pid"
+
+stop_pid() {
+  local pid="$1"
+  if ! kill -0 "$pid" 2>/dev/null; then
+    return 0
+  fi
+  kill "$pid" 2>/dev/null || true
+  for _ in {1..10}; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      return 0
+    fi
+    sleep 1
+  done
+  kill -9 "$pid" 2>/dev/null || true
+}
+
+if [[ -f "$PID_FILE" ]]; then
+  pid="$(tr -d '[:space:]' < "$PID_FILE")"
+  if [[ -n "${pid:-}" ]]; then
+    stop_pid "$pid"
+  fi
+  rm -f "$PID_FILE"
+fi
+
+while read -r pid; do
+  [[ -n "${pid:-}" ]] || continue
+  stop_pid "$pid"
+done < <(pgrep -f '/max2tg/main.py|python3 -u main.py|Python main.py' || true)
+
+echo "Bot stopped"

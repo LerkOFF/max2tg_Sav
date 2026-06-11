@@ -1,0 +1,23 @@
+services:
+  max2tg:
+    build:
+      context: .
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    init: true
+    volumes:
+      - ./.env:/app/.env:ro
+      - ./data:/app/data
+      - ./logs:/app/logs
+    env_file:
+      - .env
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - /opt/python/bin/python3 -c "import socket; socket.create_connection(('api.telegram.org', 443), 5).close(); socket.create_connection(('api-gost.oneme.ru', 443), 5).close()"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped

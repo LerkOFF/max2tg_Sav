@@ -2,6 +2,7 @@ services:
   max2tg:
     build:
       context: .
+    container_name: max2tg-bot
     stdin_open: true
     tty: true
     dns:

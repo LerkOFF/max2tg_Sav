@@ -80,8 +80,28 @@ def max_session_path() -> Path:
     return MAX_SESSION_DIR / MAX_SESSION_NAME
 
 
+def is_max_session_usable() -> bool:
+    path = max_session_path()
+    if not path.exists():
+        return False
+    import sqlite3
+
+    try:
+        with sqlite3.connect(path) as conn:
+            row = conn.execute("SELECT token FROM sessions LIMIT 1").fetchone()
+    except sqlite3.Error:
+        return False
+    return bool(row and row[0])
+
+
+def remove_stale_max_session() -> None:
+    path = max_session_path()
+    if path.exists():
+        path.unlink(missing_ok=True)
+
+
 def is_max_authorized() -> bool:
-    return max_session_path().exists()
+    return is_max_session_usable()
 
 
 def _read_sms_code_file() -> str | None:
@@ -156,7 +176,7 @@ async def authorize_max(*, sms_code: str | None = None, source: str = "waiting")
     try:
         await client.start()
     except (asyncio.CancelledError, Exception):
-        if not auth_completed and not session_path.exists():
+        if not auth_completed and not is_max_session_usable():
             raise
 
 
@@ -164,6 +184,13 @@ async def ensure_max_session() -> None:
     if is_max_authorized():
         print(f"MAX session found: {max_session_path()}", flush=True)
         return
+
+    if max_session_path().exists():
+        print(
+            "MAX session file exists but contains no token; re-authorization required...",
+            flush=True,
+        )
+        remove_stale_max_session()
 
     print("MAX session not found. Starting authorization...", flush=True)
 

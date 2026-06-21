@@ -2073,8 +2073,9 @@ async def tg_edit_to_max(m: Message):
 async def main():
     await db.init()
     max_bridge.set_on_event(on_max_event)
-    asyncio.create_task(start_max_runtime_forever())
-    logger.info("Starting bot...")
+    await start_max_runtime_forever()
+    logger.info("MAX runtime ready, starting Telegram polling...")
+    await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(
         bot,
         polling_timeout=TG_POLLING_TIMEOUT,

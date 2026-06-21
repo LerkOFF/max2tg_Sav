@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 from config import DATA_DIR, MAX_DEVICE_ID, MAX_PHONE, MAX_SESSION_DIR, MAX_SESSION_NAME
+from max_auth import is_max_session_usable
 
 
 @dataclass
@@ -176,7 +177,7 @@ class MaxBridge:
         return MAX_SESSION_DIR / MAX_SESSION_NAME
 
     def is_authorized(self) -> bool:
-        return self.session_path.exists()
+        return is_max_session_usable()
 
     def set_on_event(self, on_event) -> None:
         self.on_event = on_event

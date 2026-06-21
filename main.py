@@ -2115,7 +2115,7 @@ async def tg_to_max(m: Message):
                     chat_id=mcid,
                     input_path=tmp,
                     duration=m.voice.duration or 0,
-                    telegram_waveform=m.voice.waveform,
+                    telegram_waveform=getattr(m.voice, "waveform", None),
                 )
                 sent_message_id = int(sent_message.get("id") or 0) if isinstance(sent_message, dict) else 0
                 if sent_message_id:

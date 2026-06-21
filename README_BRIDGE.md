@@ -33,6 +33,9 @@ Optional:
 - `MAX_DEVICE_ID=max2tg-bridge`
 - `MAX_SESSION_DIR=pymax`
 - `MAX_SESSION_NAME=session.db`
+- `STARTUP_BACKFILL_ENABLED=true` — backfill recent history on startup
+- `STARTUP_BACKFILL_CHATS_LIMIT=10` — only the N most recent MAX dialogs
+- `STARTUP_BACKFILL_MESSAGES_PER_CHAT=10` — messages per dialog on startup
 
 ## Runtime architecture
 
@@ -60,7 +63,10 @@ Do not commit:
   the underlying `pymax` event/API exposes the data.
 - Mirrors Telegram topic messages back to the mapped MAX chat.
 - Suppresses echo messages from Telegram -> MAX -> Telegram using message IDs.
-- Replays recent history when a new Telegram topic is created.
+- On startup: creates topics for all MAX chats, then backfills only the most
+  recent dialogs in the background (defaults: 10 chats x 10 messages).
+- After startup: only live messages are mirrored; new MAX chats get a topic
+  without history replay.
 
 ## Known limits
 

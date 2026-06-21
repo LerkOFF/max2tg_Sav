@@ -89,9 +89,11 @@ _invalid_tg_reaction_emojis: set[str] = set()
 _tg_reaction_lock = asyncio.Lock()
 _last_tg_reaction_at = 0.0
 BRIDGE_MESSAGE_TTL_SECONDS = 300.0
-BACKFILL_MESSAGES_PER_CHAT = int(os.getenv("BACKFILL_MESSAGES_PER_CHAT", "5"))
+BACKFILL_MESSAGES_PER_CHAT = int(os.getenv("BACKFILL_MESSAGES_PER_CHAT", "10"))
 BACKFILL_PAGE_SIZE = int(os.getenv("BACKFILL_PAGE_SIZE", "50"))
-STARTUP_BACKFILL_MESSAGES_PER_CHAT = int(os.getenv("STARTUP_BACKFILL_MESSAGES_PER_CHAT", "50"))
+STARTUP_BACKFILL_ENABLED = os.getenv("STARTUP_BACKFILL_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+STARTUP_BACKFILL_CHATS_LIMIT = int(os.getenv("STARTUP_BACKFILL_CHATS_LIMIT", "10"))
+STARTUP_BACKFILL_MESSAGES_PER_CHAT = int(os.getenv("STARTUP_BACKFILL_MESSAGES_PER_CHAT", "10"))
 MAX_STATE_SYNC_MESSAGES_PER_CHAT = int(os.getenv("MAX_STATE_SYNC_MESSAGES_PER_CHAT", "20"))
 MAX_STATE_SYNC_INTERVAL_SECONDS = int(os.getenv("MAX_STATE_SYNC_INTERVAL_SECONDS", "300"))
 MAX_STARTUP_RETRY_SECONDS = int(os.getenv("MAX_STARTUP_RETRY_SECONDS", "30"))
@@ -195,6 +197,33 @@ def is_recent_tg_reaction_update(chat_id: int, message_id: int) -> bool:
         _recent_tg_reaction_message_keys.pop(key, None)
         return False
     return True
+
+
+def _chat_last_activity(chat: dict | None) -> int:
+    if not isinstance(chat, dict):
+        return 0
+    last_message = chat.get("lastMessage")
+    if not isinstance(last_message, dict):
+        return 0
+    try:
+        return int(last_message.get("time") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _build_chat_activity_index(chats: list[dict]) -> dict[int, int]:
+    activity: dict[int, int] = {}
+    for chat in chats:
+        if not isinstance(chat, dict):
+            continue
+        chat_id = chat.get("id")
+        if chat_id is None:
+            continue
+        try:
+            activity[int(chat_id)] = _chat_last_activity(chat)
+        except (TypeError, ValueError):
+            continue
+    return activity
 
 
 def get_chat_title(chat: dict, chat_id: int) -> str:
@@ -1699,7 +1728,11 @@ async def load_mapped_chat_ids() -> list[int]:
     return [int(row[0]) for row in rows]
 
 
-async def backfill_existing_topics(count: int = STARTUP_BACKFILL_MESSAGES_PER_CHAT) -> None:
+async def backfill_existing_topics(
+    *,
+    count: int = STARTUP_BACKFILL_MESSAGES_PER_CHAT,
+    chats_limit: int = STARTUP_BACKFILL_CHATS_LIMIT,
+) -> None:
     async with aiosqlite.connect(db.db_path) as conn:
         async with conn.execute(
             "SELECT max_chat_id, tg_thread_id, COALESCE(chat_name, '') FROM chat_mapping ORDER BY chat_name, max_chat_id"
@@ -1708,9 +1741,30 @@ async def backfill_existing_topics(count: int = STARTUP_BACKFILL_MESSAGES_PER_CH
     if not rows:
         return
 
-    replay_label = "all available" if count <= 0 else str(count)
-    logger.info("Startup backfill for %s existing topics; messages_per_chat=%s", len(rows), replay_label)
-    for chat_id, thread_id, chat_name in rows:
+    if count <= 0 or chats_limit <= 0:
+        logger.info("Startup message backfill skipped (count=%s chats_limit=%s)", count, chats_limit)
+        return
+
+    try:
+        chats = max_bridge.get_login_chats()
+        if not chats:
+            chats = await asyncio.wait_for(max_bridge.list_chats(), timeout=20)
+    except Exception as exc:
+        logger.warning("Failed to load Max chats for startup backfill ordering: %s", exc)
+        chats = []
+
+    activity = _build_chat_activity_index(chats)
+    rows.sort(key=lambda row: activity.get(int(row[0]), 0), reverse=True)
+    selected_rows = rows[:chats_limit]
+
+    replay_label = str(count)
+    logger.info(
+        "Startup backfill for %s recent topics (of %s mapped); messages_per_chat=%s",
+        len(selected_rows),
+        len(rows),
+        replay_label,
+    )
+    for chat_id, thread_id, chat_name in selected_rows:
         try:
             await replay_recent_messages_to_topic(int(chat_id), int(thread_id), count=count)
         except Exception as exc:
@@ -1722,6 +1776,16 @@ async def backfill_existing_topics(count: int = STARTUP_BACKFILL_MESSAGES_PER_CH
                 exc,
             )
         await asyncio.sleep(0.1)
+
+
+async def backfill_startup_topics_async() -> None:
+    if not STARTUP_BACKFILL_ENABLED:
+        logger.info("Startup message backfill disabled via STARTUP_BACKFILL_ENABLED")
+        return
+    await backfill_existing_topics(
+        count=STARTUP_BACKFILL_MESSAGES_PER_CHAT,
+        chats_limit=STARTUP_BACKFILL_CHATS_LIMIT,
+    )
 
 
 async def ensure_chat_topic(chat_id: int, chat_info: dict | None = None, replay_recent_history: bool = False) -> int | None:
@@ -1885,9 +1949,9 @@ async def start_max_runtime_forever() -> None:
             await sync(verbose=True)
             chat_ids = await load_mapped_chat_ids()
             logger.info("Prepared %s chats for Max subscription", len(chat_ids))
-            await backfill_existing_topics()
             asyncio.create_task(reconcile_chats_forever())
             asyncio.create_task(sync_recent_message_states_forever())
+            asyncio.create_task(backfill_startup_topics_async())
             return
 
         logger.warning("Max SDK startup failed; retrying in %ss", MAX_STARTUP_RETRY_SECONDS)

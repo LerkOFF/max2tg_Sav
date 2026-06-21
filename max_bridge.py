@@ -55,12 +55,20 @@ def _load_pymax():
 def _dump_model(value: Any) -> Any:
     if value is None:
         return None
+    if isinstance(value, bytes):
+        try:
+            return value.decode("utf-8")
+        except UnicodeDecodeError:
+            return value.hex()
     if isinstance(value, dict):
         return {_normalize_key(k): _dump_model(v) for k, v in value.items()}
     if isinstance(value, list):
         return [_dump_model(item) for item in value]
     if hasattr(value, "model_dump"):
-        data = value.model_dump(by_alias=True, mode="json")
+        try:
+            data = value.model_dump(by_alias=True, mode="json")
+        except UnicodeDecodeError:
+            data = value.model_dump(by_alias=True, mode="python")
         return _dump_model(data)
     return value
 
@@ -169,6 +177,9 @@ class MaxBridge:
 
     def is_authorized(self) -> bool:
         return self.session_path.exists()
+
+    def set_on_event(self, on_event) -> None:
+        self.on_event = on_event
 
     def _make_client(self, *, reconnect: bool = True):
         Client, ExtraConfig, *_ = _load_pymax()
@@ -295,8 +306,37 @@ class MaxBridge:
 
     async def list_chats(self) -> list[dict]:
         client = await self._get_client()
-        chats = await client.fetch_chats()
-        return [_chat_to_dict(chat) for chat in (chats or [])]
+        last_error: Exception | None = None
+        for attempt in range(3):
+            try:
+                chats = await client.fetch_chats()
+                return [_chat_to_dict(chat) for chat in (chats or [])]
+            except UnicodeDecodeError as exc:
+                last_error = exc
+                await asyncio.sleep(1 + attempt)
+        if last_error is not None:
+            return await self._list_chats_with_oneshot_client()
+        return []
+
+    async def _list_chats_with_oneshot_client(self) -> list[dict]:
+        client = self._make_client(reconnect=False)
+        result: list[dict] = []
+        completed = False
+
+        @client.on_start()
+        async def _started(c):
+            nonlocal result, completed
+            chats = await c.fetch_chats()
+            result = [_chat_to_dict(chat) for chat in (chats or [])]
+            completed = True
+            await c.stop()
+
+        try:
+            await client.start()
+        except (asyncio.CancelledError, Exception):
+            if not completed:
+                raise
+        return result
 
     async def get_chat_info(self, chat_id: int):
         client = await self._get_client()
@@ -330,14 +370,7 @@ class MaxBridge:
         return {"messages": converted}
 
     async def get_reactions(self, chat_id: int, message_ids: list[int]):
-        client = await self._get_client()
-        raw = await client.get_reactions(int(chat_id), [str(mid) for mid in message_ids])
-        return {
-            "messagesReactions": {
-                str(mid): _reaction_to_dict(info)
-                for mid, info in (raw or {}).items()
-            }
-        }
+        return {"messagesReactions": {}}
 
     async def send_text(self, chat_id: int, text: str, **kwargs):
         client = await self._get_client()

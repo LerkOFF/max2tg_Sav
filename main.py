@@ -235,7 +235,7 @@ def format_max_text(text: str, elements: list) -> str:
 
     inserts = []
     for i, e in enumerate(elements):
-        frm, lng, typ = e.get("from", 0), e.get("length", 0), e.get("type")
+        frm, lng, typ = e.get("from") or 0, e.get("length") or 0, e.get("type")
         tag_open, tag_close = "", ""
         if typ == "STRONG": tag_open, tag_close = "<b>", "</b>"
         elif typ == "ITALIC": tag_open, tag_close = "<i>", "</i>"

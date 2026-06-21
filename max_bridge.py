@@ -5,13 +5,25 @@ import mimetypes
 import os
 import re
 import shutil
+import time
 from dataclasses import dataclass
+from http import HTTPStatus
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
 
+import aiohttp
+
 from config import DATA_DIR, MAX_DEVICE_ID, MAX_PHONE, MAX_SESSION_DIR, MAX_SESSION_NAME
+from max_audio import (
+    build_audio_attach_payload,
+    duration_seconds_to_ms,
+    is_attachment_not_ready_error,
+    telegram_waveform_to_max_wave,
+    voice_mime_type,
+    voice_upload_name,
+)
 from max_auth import is_max_session_usable
 
 
@@ -387,6 +399,169 @@ class MaxBridge:
 
     async def send_local_file(self, **kwargs):
         return await self._send_local_attachment("file", **kwargs)
+
+    async def send_local_audio(self, **kwargs):
+        client = await self._get_client()
+        path = kwargs.get("path") or kwargs.get("file_path") or kwargs.get("input_path")
+        if not path:
+            raise ValueError("path is required")
+        chat_id = int(kwargs["chat_id"])
+        caption = kwargs.get("text") or kwargs.get("caption") or ""
+        reply_to = kwargs.get("reply_to")
+        duration_sec = int(kwargs.get("duration") or 0)
+        wave = kwargs.get("wave") or kwargs.get("waveform")
+        if wave is None and kwargs.get("telegram_waveform") is not None:
+            wave = telegram_waveform_to_max_wave(
+                kwargs.get("telegram_waveform"),
+                duration_sec=duration_sec,
+            )
+        elif wave is None and duration_sec > 0:
+            wave = telegram_waveform_to_max_wave(None, duration_sec=duration_sec)
+
+        attach = await self._upload_audio_attachment(
+            client,
+            chat_id=chat_id,
+            input_path=Path(path),
+            duration_sec=duration_sec,
+            wave=wave,
+        )
+        message = await self._send_message_with_audio_attach(
+            client,
+            chat_id=chat_id,
+            text=caption,
+            attach=attach,
+            reply_to=reply_to,
+        )
+        return _message_to_dict(message) if message else None
+
+    async def _upload_audio_attachment(
+        self,
+        client: Any,
+        *,
+        chat_id: int,
+        input_path: Path,
+        duration_sec: int,
+        wave: str | None,
+    ) -> dict:
+        from pymax.api.uploads.models import FileUploadResponse
+        from pymax.api.uploads.payloads import UploadPayload
+        from pymax.exceptions import UploadError
+        from pymax.protocol import Opcode
+        from pymax.types.events import FileUploadSignal
+
+        app = client._app
+        uploads = app.api.uploads
+        file_path = Path(input_path)
+        if not file_path.is_file():
+            raise FileNotFoundError(f"Audio file not found: {file_path}")
+
+        await app.invoke(
+            Opcode.MSG_TYPING,
+            {"chatId": chat_id, "type": "AUDIO"},
+        )
+
+        data = await app.invoke(
+            Opcode.FILE_UPLOAD,
+            UploadPayload().model_dump(),
+        )
+        try:
+            response = FileUploadResponse.model_validate(data.payload)
+            upload_info = response.info[0]
+        except (IndexError, TypeError, ValueError) as exc:
+            raise UploadError("Invalid audio upload response from Max") from exc
+
+        file_id = upload_info.file_id
+        token = upload_info.token
+        file_size = file_path.stat().st_size
+        filename = voice_upload_name(file_path)
+        mime_type = voice_mime_type(file_path)
+
+        headers = {
+            "Content-Disposition": f"attachment; filename={quote(filename)}",
+            "Content-Length": str(file_size),
+            "Content-Range": f"0-{file_size - 1}/{file_size}",
+        }
+
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[FileUploadSignal] = loop.create_future()
+        uploads.file_upload_waiters[file_id] = future
+
+        try:
+            async with aiohttp.ClientSession(proxy=app.config.proxy) as session:
+                async with session.post(
+                    url=upload_info.url,
+                    headers=headers,
+                    data=file_path.read_bytes(),
+                ) as http_response:
+                    if http_response.status != HTTPStatus.OK:
+                        raise UploadError(
+                            f"Audio upload failed with status {http_response.status} file_id={file_id}"
+                        )
+                await asyncio.wait_for(future, 60)
+        except asyncio.TimeoutError as exc:
+            raise UploadError(f"Timed out waiting for audio processing file_id={file_id}") from exc
+        finally:
+            uploads.file_upload_waiters.pop(file_id, None)
+
+        return build_audio_attach_payload(
+            audio_id=file_id,
+            token=token,
+            duration_ms=duration_seconds_to_ms(duration_sec),
+            wave=wave,
+        )
+
+    async def _send_message_with_audio_attach(
+        self,
+        client: Any,
+        *,
+        chat_id: int,
+        text: str,
+        attach: dict,
+        reply_to: int | None = None,
+        max_attempts: int = 8,
+    ):
+        from pymax.api.binding import bind_api_model
+        from pymax.api.response import require_payload_model
+        from pymax.exceptions import ApiError
+        from pymax.protocol import Opcode
+        from pymax.types.domain import Message
+
+        app = client._app
+        last_error: Exception | None = None
+        for attempt in range(max_attempts):
+            cid = int(time.time() * 1000) + attempt
+            payload: dict[str, Any] = {
+                "chatId": chat_id,
+                "message": {
+                    "text": text or "",
+                    "cid": cid,
+                    "elements": [],
+                    "attaches": [attach],
+                },
+                "notify": True,
+            }
+            if reply_to is not None:
+                payload["message"]["link"] = {
+                    "type": "REPLY",
+                    "messageId": int(reply_to),
+                }
+            try:
+                response = await app.invoke(Opcode.MSG_SEND, payload)
+                return bind_api_model(app, require_payload_model(response, Message))
+            except ApiError as exc:
+                last_error = exc
+                error_text = " ".join(
+                    part
+                    for part in (exc.error, exc.message, exc.localized_message, str(exc))
+                    if part
+                )
+                if is_attachment_not_ready_error(error_text) and attempt + 1 < max_attempts:
+                    await asyncio.sleep(1 + attempt)
+                    continue
+                raise
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("Failed to send audio attachment to Max")
 
     async def _send_local_attachment(self, kind: str, **kwargs):
         client = await self._get_client()

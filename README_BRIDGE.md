@@ -61,7 +61,8 @@ Do not commit:
 - Creates one Telegram forum topic per MAX chat/dialog/channel.
 - Mirrors MAX -> Telegram messages, media, edits, deletes, and reactions where
   the underlying `pymax` event/API exposes the data.
-- Mirrors Telegram topic messages back to the mapped MAX chat.
+- Mirrors Telegram topic messages back to the mapped MAX chat, including voice
+  messages as native MAX `AUDIO` attachments (not generic files).
 - Suppresses echo messages from Telegram -> MAX -> Telegram using message IDs.
 - On startup: creates topics for all MAX chats, then backfills only the most
   recent dialogs in the background (defaults: 10 chats x 10 messages).
@@ -70,6 +71,10 @@ Do not commit:
 
 ## Known limits
 
+- TG -> MAX voice uses `FILE_UPLOAD` (opcode 87) with `MSG_TYPING` type `AUDIO`
+  and sends an `AUDIO` attach (`audioId`, `token`, `duration`, `wave`). This
+  follows the vkmax upload pattern; if Max changes the protocol, compare incoming
+  `AUDIO` attach logs with outgoing payloads.
 - History pagination is adapted to `pymax` history API and may need tuning after
   live testing on real chats.
 - Media download URL availability depends on what MAX returns for each

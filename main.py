@@ -13,6 +13,7 @@ from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError, Telegra
 from aiogram.types import Message, FSInputFile, ReactionTypeEmoji
 from config import CHAT_RECONCILE_INTERVAL_SECONDS, TG_BOT_TOKEN, TG_GROUP_ID, TG_POLLING_TIMEOUT
 from database import BridgeDB
+from max_audio import voice_temp_path
 from max_bridge import (
     MaxBridge,
     MaxContactEvent,
@@ -1834,6 +1835,14 @@ async def on_max_message_event(event: MaxMessageEvent) -> None:
     if cid is None:
         logger.debug("Skipping Max message event without chat id: %s", event)
         return
+    for attach in msg.get("attaches") or []:
+        if isinstance(attach, dict) and attach.get("_type") == "AUDIO":
+            logger.info(
+                "Max incoming AUDIO attach chat_id=%s message_id=%s payload=%s",
+                cid,
+                event.message_id,
+                attach,
+            )
     if is_recent_bridge_message(event.message_id):
         logger.info("Skipping echoed bridge message from Max chat_id=%s message_id=%s", cid, event.message_id)
         return
@@ -1989,12 +1998,13 @@ async def tg_to_max(m: Message):
     if mcid is None: return
     
     logger.info(
-        "TG->Max: Received message in topic %s (Max CID: %s), has_text=%s has_photo=%s has_video=%s",
+        "TG->Max: Received message in topic %s (Max CID: %s), has_text=%s has_photo=%s has_video=%s has_voice=%s",
         m.message_thread_id,
         mcid,
         bool(m.text),
         bool(m.photo),
         bool(m.video),
+        bool(m.voice),
     )
     
     try:
@@ -2087,6 +2097,49 @@ async def tg_to_max(m: Message):
                         TG_GROUP_ID,
                         message_thread_id=m.message_thread_id,
                         text="Видео не подтверждено в Max после отправки. Нужна дополнительная проверка протокола.",
+                    )
+            finally:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+        elif m.voice:
+            logger.info(
+                "TG->Max: Processing voice file_id=%s duration=%s mime_type=%s",
+                m.voice.file_id,
+                m.voice.duration,
+                m.voice.mime_type,
+            )
+            tmp = voice_temp_path(m.voice.file_id)
+            try:
+                await bot.download(m.voice, destination=tmp)
+                sent_message = await max_bridge.send_local_audio(
+                    chat_id=mcid,
+                    input_path=tmp,
+                    duration=m.voice.duration or 0,
+                    telegram_waveform=m.voice.waveform,
+                )
+                sent_message_id = int(sent_message.get("id") or 0) if isinstance(sent_message, dict) else 0
+                if sent_message_id:
+                    remember_bridge_message(sent_message_id)
+                confirmed = await confirm_max_message(mcid, sent_message_id)
+                if confirmed:
+                    await _record_tg_to_max_mapping(m, max_chat_id=mcid, max_message_id=sent_message_id)
+                    logger.info(
+                        "TG->Max: Voice sent to Max chat_id=%s file_id=%s message_id=%s",
+                        mcid,
+                        m.voice.file_id,
+                        sent_message_id,
+                    )
+                else:
+                    logger.error(
+                        "TG->Max: Max did not confirm voice message chat_id=%s file_id=%s message_id=%s",
+                        mcid,
+                        m.voice.file_id,
+                        sent_message_id,
+                    )
+                    await bot.send_message(
+                        TG_GROUP_ID,
+                        message_thread_id=m.message_thread_id,
+                        text="Голосовое не подтверждено в Max после отправки. Нужна дополнительная проверка протокола.",
                     )
             finally:
                 if os.path.exists(tmp):

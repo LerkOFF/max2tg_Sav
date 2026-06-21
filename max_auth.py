@@ -21,6 +21,61 @@ class EnvSmsCodeProvider:
         return self._code
 
 
+class WaitingSmsCodeProvider:
+    """Waits for SMS code from env, file, or terminal without crashing on EOF."""
+
+    async def get_code(self, phone: str) -> str:
+        SMS_CODE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        print(
+            f"SMS code requested for {phone}.\n"
+            f"Provide it in one of these ways:\n"
+            f"  1. Write the code to {SMS_CODE_FILE}\n"
+            f"  2. Set MAX_SMS_CODE in .env and restart the container\n"
+            f"  3. Enter the code in this terminal if input is available",
+            flush=True,
+        )
+
+        stdin_task: asyncio.Task[str] | None = None
+        if sys.stdin.isatty():
+            stdin_task = asyncio.create_task(
+                asyncio.to_thread(input, f"Enter SMS code for {phone}: ")
+            )
+
+        try:
+            while True:
+                code, source = _resolve_sms_code()
+                if code:
+                    print(f"Using SMS code from {source}", flush=True)
+                    if source == str(SMS_CODE_FILE):
+                        _clear_sms_code_file()
+                    return code
+
+                if stdin_task is not None:
+                    if stdin_task.done():
+                        try:
+                            entered = stdin_task.result().strip()
+                        except Exception as exc:
+                            raise RuntimeError("Failed to read SMS code from terminal") from exc
+                        if entered:
+                            print("Using SMS code from terminal", flush=True)
+                            return entered
+                        stdin_task = asyncio.create_task(
+                            asyncio.to_thread(input, f"Enter SMS code for {phone}: ")
+                        )
+                    elif stdin_task.cancelled():
+                        stdin_task = None
+
+                print(
+                    f"Waiting for SMS code for {phone}... "
+                    f"(write it to {SMS_CODE_FILE} or enter in terminal)",
+                    flush=True,
+                )
+                await asyncio.sleep(SMS_CODE_POLL_SECONDS)
+        finally:
+            if stdin_task is not None and not stdin_task.done():
+                stdin_task.cancel()
+
+
 def max_session_path() -> Path:
     return MAX_SESSION_DIR / MAX_SESSION_NAME
 
@@ -58,14 +113,18 @@ def _resolve_sms_code() -> tuple[str | None, str]:
     return None, ""
 
 
-async def authorize_max(*, sms_code: str | None = None, source: str = "interactive") -> None:
+async def authorize_max(*, sms_code: str | None = None, source: str = "waiting") -> None:
     if not MAX_PHONE:
         raise RuntimeError("Set MAX_PHONE in .env, for example MAX_PHONE=+79990000000")
 
-    from pymax import Client, ConsoleSmsCodeProvider, ExtraConfig
+    from pymax import Client, ExtraConfig
 
     MAX_SESSION_DIR.mkdir(parents=True, exist_ok=True)
-    provider = EnvSmsCodeProvider(sms_code) if sms_code else ConsoleSmsCodeProvider()
+    if sms_code:
+        provider = EnvSmsCodeProvider(sms_code)
+    else:
+        provider = WaitingSmsCodeProvider()
+
     client = Client(
         phone=MAX_PHONE,
         session_name=MAX_SESSION_NAME,
@@ -109,32 +168,12 @@ async def ensure_max_session() -> None:
     print("MAX session not found. Starting authorization...", flush=True)
 
     sms_code, source = _resolve_sms_code()
-    if sms_code:
-        await authorize_max(sms_code=sms_code, source=source)
-        if source == str(SMS_CODE_FILE):
-            _clear_sms_code_file()
-        return
-
-    if sys.stdin.isatty():
-        await authorize_max(source="console")
-        return
-
-    SMS_CODE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    print(
-        "Waiting for MAX SMS code.\n"
-        f"- write the code to {SMS_CODE_FILE}, or\n"
-        "- set MAX_SMS_CODE in .env and restart the container, or\n"
-        "- run `docker compose up` in the foreground and enter the code in the terminal.",
-        flush=True,
+    await authorize_max(
+        sms_code=sms_code,
+        source=source if sms_code else "waiting",
     )
-    while not is_max_authorized():
-        sms_code, source = _resolve_sms_code()
-        if sms_code:
-            await authorize_max(sms_code=sms_code, source=source)
-            if source == str(SMS_CODE_FILE):
-                _clear_sms_code_file()
-            return
-        await asyncio.sleep(SMS_CODE_POLL_SECONDS)
+    if sms_code and source == str(SMS_CODE_FILE):
+        _clear_sms_code_file()
 
 
 async def main() -> None:

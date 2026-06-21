@@ -58,9 +58,22 @@ On the first start the container will:
 
 Ways to enter the SMS code on first start:
 
-- enter it in the terminal when running `docker compose up`
-- write the code to `data/.max_sms_code` while the container is waiting
+```bash
+docker compose up --build
+```
+
+When you see `SMS code requested for +7...` in the logs, run in another terminal:
+
+```bash
+echo 123456 > data/.max_sms_code
+```
+
+Other options:
+
+- enter the code in the terminal when running `docker compose up`
 - set `MAX_SMS_CODE=123456` in `.env` and restart the container
+
+The container keeps waiting for the code and will not exit until auth succeeds.
 
 After the first successful auth, the same command also works in the background:
 

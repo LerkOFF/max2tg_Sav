@@ -53,7 +53,10 @@ def main() -> None:
     except KeyboardInterrupt:
         raise SystemExit(130)
     except Exception as exc:
+        import traceback
+
         print(f"Startup failed: {exc}", file=sys.stderr, flush=True)
+        traceback.print_exc()
         raise SystemExit(1) from exc
     start_bridge()
 

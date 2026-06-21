@@ -101,6 +101,7 @@ TG_VIDEO_SEND_TIMEOUT_SECONDS = int(os.getenv("TG_VIDEO_SEND_TIMEOUT_SECONDS", "
 TG_REACTION_MIN_INTERVAL_SECONDS = float(os.getenv("TG_REACTION_MIN_INTERVAL_SECONDS", "0.5"))
 TG_REACTION_UPDATE_TTL_SECONDS = float(os.getenv("TG_REACTION_UPDATE_TTL_SECONDS", "3600"))
 TG_VIEWED_REACTION = os.getenv("TG_VIEWED_REACTION", "👀")
+TG_FORUM_TOPIC_CREATE_DELAY_SECONDS = float(os.getenv("TG_FORUM_TOPIC_CREATE_DELAY_SECONDS", "1.0"))
 
 
 def _pid_is_running(pid: int) -> bool:
@@ -458,10 +459,6 @@ def _build_max_message_text(msg: dict) -> tuple[str, str]:
     return html_text.strip(), plain_text.strip()
 
 
-def _is_tg_entity_parse_error(exc: TelegramBadRequest) -> bool:
-    return "can't parse entities" in str(exc).lower()
-
-
 async def _run_tg_send_with_retry(action_name: str, sender):
     network_attempt = 1
     while True:
@@ -488,6 +485,20 @@ async def _run_tg_send_with_retry(action_name: str, sender):
                 exc,
             )
             network_attempt += 1
+            await asyncio.sleep(delay)
+
+
+async def _create_forum_topic_with_retry(title: str):
+    while True:
+        try:
+            return await bot.create_forum_topic(TG_GROUP_ID, title)
+        except TelegramRetryAfter as exc:
+            delay = int(exc.retry_after) + 1
+            logger.warning(
+                "Flood control on create_forum_topic '%s', sleeping %ss",
+                title,
+                delay,
+            )
             await asyncio.sleep(delay)
 
 
@@ -1205,27 +1216,44 @@ async def _send_max_message_to_topic(chat_id: int, msg: dict, thread_id: int) ->
             if mid:
                 photo_index = attach_type_offsets["PHOTO"]
                 attach_type_offsets["PHOTO"] += 1
-                if render_msg is linked_msg:
-                    photo_info = await _download_forwarded_photo(chat_id, int(mid), photo_index, attach)
-                else:
-                    photo_info = await max_bridge.download_photo(
-                        chat_id=chat_id,
-                        message_id=mid,
-                        attach_index=photo_index,
-                    )
-                photo_path = photo_info["saved_path"]
                 try:
-                    sent_messages.append(
-                        await _send_tg_photo_html_safe(
-                            thread_id=thread_id,
-                            photo=FSInputFile(photo_path),
-                            html_caption=caption,
-                            plain_caption=plain_caption,
+                    if render_msg is linked_msg:
+                        photo_info = await _download_forwarded_photo(chat_id, int(mid), photo_index, attach)
+                    else:
+                        photo_info = await max_bridge.download_photo(
+                            chat_id=chat_id,
+                            message_id=mid,
+                            attach_index=photo_index,
+                            attach=attach,
                         )
+                    photo_path = photo_info["saved_path"]
+                    try:
+                        sent_messages.append(
+                            await _send_tg_photo_html_safe(
+                                thread_id=thread_id,
+                                photo=FSInputFile(photo_path),
+                                html_caption=caption,
+                                plain_caption=plain_caption,
+                            )
+                        )
+                    finally:
+                        if os.path.exists(photo_path):
+                            os.remove(photo_path)
+                except Exception:
+                    logger.exception(
+                        "Failed to download/send Max photo chat_id=%s message_id=%s",
+                        chat_id,
+                        mid,
                     )
-                finally:
-                    if os.path.exists(photo_path):
-                        os.remove(photo_path)
+                    if caption or plain_caption:
+                        sent_messages.append(
+                            await _send_tg_message_html_safe(
+                                thread_id=thread_id,
+                                html_text=caption or plain_caption,
+                                plain_text=plain_caption or caption,
+                            )
+                        )
+                        text_sent = True
         elif attach.get("_type") == "VIDEO":
             if mid:
                 video_index = attach_type_offsets["VIDEO"]
@@ -1569,17 +1597,25 @@ async def replay_recent_messages_to_topic(chat_id: int, thread_id: int, count: i
                 clear_when_empty=True,
             )
             continue
-        sent_messages = await _send_max_message_to_topic(chat_id, msg, thread_id)
-        await _store_max_to_tg_mapping(chat_id, message_id, thread_id, sent_messages)
-        await _sync_max_message_state_to_tg(
-            chat_id,
-            message_id,
-            msg,
-            reaction_info,
-            chat_info=chat_info,
-            clear_when_empty=True,
-        )
-        await asyncio.sleep(0.1)
+        try:
+            sent_messages = await _send_max_message_to_topic(chat_id, msg, thread_id)
+            await _store_max_to_tg_mapping(chat_id, message_id, thread_id, sent_messages)
+            await _sync_max_message_state_to_tg(
+                chat_id,
+                message_id,
+                msg,
+                reaction_info,
+                chat_info=chat_info,
+                clear_when_empty=True,
+            )
+            await asyncio.sleep(0.1)
+        except Exception as exc:
+            logger.warning(
+                "Skipping backfill message chat_id=%s message_id=%s: %s",
+                chat_id,
+                message_id,
+                exc,
+            )
 
 
 async def sync_recent_message_states(count: int = MAX_STATE_SYNC_MESSAGES_PER_CHAT) -> None:
@@ -1714,9 +1750,11 @@ async def ensure_chat_topic(chat_id: int, chat_info: dict | None = None, replay_
         await ensure_user_names_for_chat(chat_info)
         title = get_chat_title(chat_info, chat_id)
         logger.info("Creating Telegram topic for Max chat %s: %s", chat_id, title)
-        topic = await bot.create_forum_topic(TG_GROUP_ID, title)
+        topic = await _create_forum_topic_with_retry(title)
         tid = topic.message_thread_id
         await db.save_mapping(chat_id, tid, title)
+        if TG_FORUM_TOPIC_CREATE_DELAY_SECONDS > 0:
+            await asyncio.sleep(TG_FORUM_TOPIC_CREATE_DELAY_SECONDS)
 
         if replay_recent_history:
             try:
@@ -1822,7 +1860,7 @@ async def sync(*, verbose: bool = False):
                 continue
             try:
                 await ensure_user_names_for_chat(c)
-                tid = await ensure_chat_topic(cid, chat_info=c, replay_recent_history=True)
+                tid = await ensure_chat_topic(cid, chat_info=c, replay_recent_history=False)
                 if tid is not None:
                     await max_bridge.ensure_chat_subscription(cid)
             except Exception as exc:

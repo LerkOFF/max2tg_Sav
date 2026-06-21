@@ -492,12 +492,21 @@ class MaxBridge:
         candidates = [
             item
             for item in attaches
-            if isinstance(item, dict) and (item.get("_type") == expected_type or item.get("type") == expected_type)
+            if isinstance(item, dict) and self._attachment_matches_type(item, expected_type)
         ]
         index = int(kwargs.get("attach_index") or 0)
         if index >= len(candidates):
             raise IndexError(f"{expected_type} attachment index {index} is out of range")
         return candidates[index]
+
+    @staticmethod
+    def _attachment_matches_type(item: dict, expected_type: str) -> bool:
+        attach_type = item.get("_type") or item.get("type")
+        if attach_type == expected_type:
+            return True
+        if expected_type == "PHOTO" and "photoToken" in item:
+            return True
+        return False
 
     async def _download_url(
         self,

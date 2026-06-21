@@ -11,27 +11,34 @@ SMS_CODE_FILE = Path(os.getenv("MAX_SMS_CODE_FILE", "data/.max_sms_code"))
 SMS_CODE_POLL_SECONDS = float(os.getenv("MAX_SMS_CODE_POLL_SECONDS", "3"))
 
 
-class EnvSmsCodeProvider:
-    def __init__(self, code: str) -> None:
-        self._code = code.strip()
-
-    async def get_code(self, phone: str) -> str:
-        if not self._code:
-            raise RuntimeError("MAX SMS code is empty")
-        return self._code
+def _is_wrong_sms_code_error(exc: BaseException) -> bool:
+    error_code = getattr(exc, "error", None)
+    if error_code == "verify.code.wrong":
+        return True
+    return "verify.code.wrong" in str(exc)
 
 
 class WaitingSmsCodeProvider:
-    """Waits for SMS code from env, file, or terminal without crashing on EOF."""
+    """Waits for a fresh SMS code from file or terminal."""
+
+    def __init__(self) -> None:
+        self._ignored_codes = _collect_ignored_sms_codes()
+        self._file_mtime_at_start = _sms_code_file_mtime()
 
     async def get_code(self, phone: str) -> str:
         SMS_CODE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        if os.getenv("MAX_SMS_CODE", "").strip():
+            print(
+                "Warning: MAX_SMS_CODE is set in .env but is ignored during auth. "
+                f"Write the fresh SMS code to {SMS_CODE_FILE} instead, "
+                "then remove MAX_SMS_CODE from .env after successful login.",
+                flush=True,
+            )
         print(
             f"SMS code requested for {phone}.\n"
-            f"Provide it in one of these ways:\n"
-            f"  1. Write the code to {SMS_CODE_FILE}\n"
-            f"  2. Set MAX_SMS_CODE in .env and restart the container\n"
-            f"  3. Enter the code in this terminal if input is available",
+            f"Write the fresh code to {SMS_CODE_FILE}:\n"
+            f"  echo 123456 > {SMS_CODE_FILE}\n"
+            "Or enter the code in this terminal if input is available.",
             flush=True,
         )
 
@@ -43,7 +50,10 @@ class WaitingSmsCodeProvider:
 
         try:
             while True:
-                code, source = _resolve_sms_code()
+                code, source = _resolve_fresh_sms_code(
+                    ignored_codes=self._ignored_codes,
+                    file_mtime_at_start=self._file_mtime_at_start,
+                )
                 if code:
                     print(f"Using SMS code from {source}", flush=True)
                     if source == str(SMS_CODE_FILE):
@@ -56,7 +66,7 @@ class WaitingSmsCodeProvider:
                             entered = stdin_task.result().strip()
                         except Exception as exc:
                             raise RuntimeError("Failed to read SMS code from terminal") from exc
-                        if entered:
+                        if entered and entered not in self._ignored_codes:
                             print("Using SMS code from terminal", flush=True)
                             return entered
                         stdin_task = asyncio.create_task(
@@ -67,7 +77,7 @@ class WaitingSmsCodeProvider:
 
                 print(
                     f"Waiting for SMS code for {phone}... "
-                    f"(write it to {SMS_CODE_FILE} or enter in terminal)",
+                    f"(write it to {SMS_CODE_FILE})",
                     flush=True,
                 )
                 await asyncio.sleep(SMS_CODE_POLL_SECONDS)
@@ -104,6 +114,13 @@ def is_max_authorized() -> bool:
     return is_max_session_usable()
 
 
+def _sms_code_file_mtime() -> float:
+    try:
+        return SMS_CODE_FILE.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
 def _read_sms_code_file() -> str | None:
     if not SMS_CODE_FILE.exists():
         return None
@@ -123,34 +140,57 @@ def _clear_sms_code_file() -> None:
         pass
 
 
-def _resolve_sms_code() -> tuple[str | None, str]:
+def _collect_ignored_sms_codes() -> set[str]:
+    ignored: set[str] = set()
     env_code = os.getenv("MAX_SMS_CODE", "").strip()
     if env_code:
-        return env_code, "MAX_SMS_CODE"
+        ignored.add(env_code)
     file_code = _read_sms_code_file()
     if file_code:
-        return file_code, str(SMS_CODE_FILE)
-    return None, ""
+        ignored.add(file_code)
+    return ignored
 
 
-async def authorize_max(*, sms_code: str | None = None, source: str = "waiting") -> None:
+def _prepare_for_sms_auth() -> None:
+    ignored = _collect_ignored_sms_codes()
+    if ignored:
+        print(
+            "Ignoring stale SMS code(s) from previous attempts. "
+            f"Wait for a new SMS, then write the fresh code to {SMS_CODE_FILE}.",
+            flush=True,
+        )
+    _clear_sms_code_file()
+
+
+def _resolve_fresh_sms_code(
+    *,
+    ignored_codes: set[str],
+    file_mtime_at_start: float,
+) -> tuple[str | None, str]:
+    file_code = _read_sms_code_file()
+    if not file_code:
+        return None, ""
+
+    file_is_fresh = _sms_code_file_mtime() > file_mtime_at_start
+    if file_code in ignored_codes and not file_is_fresh:
+        return None, ""
+
+    return file_code, str(SMS_CODE_FILE)
+
+
+async def authorize_max() -> None:
     if not MAX_PHONE:
         raise RuntimeError("Set MAX_PHONE in .env, for example MAX_PHONE=+79990000000")
 
     from pymax import Client, ExtraConfig
 
     MAX_SESSION_DIR.mkdir(parents=True, exist_ok=True)
-    if sms_code:
-        provider = EnvSmsCodeProvider(sms_code)
-    else:
-        provider = WaitingSmsCodeProvider()
-
     client = Client(
         phone=MAX_PHONE,
         session_name=MAX_SESSION_NAME,
         work_dir=str(MAX_SESSION_DIR),
         extra_config=ExtraConfig(device_id=MAX_DEVICE_ID, reconnect=False),
-        sms_code_provider=provider,
+        sms_code_provider=WaitingSmsCodeProvider(),
     )
 
     auth_completed = False
@@ -166,13 +206,11 @@ async def authorize_max(*, sms_code: str | None = None, source: str = "waiting")
             or getattr(me, "user_id", None)
         ) if me is not None else None
         print(
-            f"MAX auth complete via {source}. "
-            f"user_id={user_id}, session={max_session_path()}",
+            f"MAX auth complete. user_id={user_id}, session={max_session_path()}",
             flush=True,
         )
         await c.stop()
 
-    session_path = max_session_path()
     try:
         await client.start()
     except (asyncio.CancelledError, Exception):
@@ -193,14 +231,30 @@ async def ensure_max_session() -> None:
         remove_stale_max_session()
 
     print("MAX session not found. Starting authorization...", flush=True)
+    _prepare_for_sms_auth()
 
-    sms_code, source = _resolve_sms_code()
-    await authorize_max(
-        sms_code=sms_code,
-        source=source if sms_code else "waiting",
-    )
-    if sms_code and source == str(SMS_CODE_FILE):
-        _clear_sms_code_file()
+    from pymax.exceptions import ApiError
+
+    while not is_max_authorized():
+        try:
+            await authorize_max()
+        except ApiError as exc:
+            if not _is_wrong_sms_code_error(exc):
+                raise
+            print(
+                "Wrong SMS code. Waiting for a new SMS and a fresh code in "
+                f"{SMS_CODE_FILE}.",
+                flush=True,
+            )
+            _prepare_for_sms_auth()
+            continue
+        except Exception:
+            if is_max_authorized():
+                return
+            raise
+
+        if is_max_authorized():
+            return
 
 
 async def main() -> None:

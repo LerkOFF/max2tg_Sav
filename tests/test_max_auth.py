@@ -7,7 +7,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from max_auth import is_max_session_usable, remove_stale_max_session
+from max_auth import (
+    _prepare_for_sms_auth,
+    _resolve_fresh_sms_code,
+    is_max_session_usable,
+    remove_stale_max_session,
+)
 
 
 class TestMaxAuth(unittest.TestCase):
@@ -80,6 +85,36 @@ class TestMaxAuth(unittest.TestCase):
             ):
                 remove_stale_max_session()
                 self.assertFalse(session_path.exists())
+
+    def test_ignores_stale_file_code_until_file_is_rewritten(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            code_file = Path(tmpdir) / ".max_sms_code"
+            code_file.write_text("805019", encoding="utf-8")
+            mtime = code_file.stat().st_mtime
+
+            with patch("max_auth.SMS_CODE_FILE", code_file):
+                code, source = _resolve_fresh_sms_code(
+                    ignored_codes={"805019"},
+                    file_mtime_at_start=mtime,
+                )
+                self.assertIsNone(code)
+
+                code_file.write_text("123456", encoding="utf-8")
+                code, source = _resolve_fresh_sms_code(
+                    ignored_codes={"805019"},
+                    file_mtime_at_start=mtime,
+                )
+                self.assertEqual(code, "123456")
+                self.assertEqual(source, str(code_file))
+
+    def test_prepare_for_sms_auth_clears_code_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            code_file = Path(tmpdir) / ".max_sms_code"
+            code_file.write_text("805019", encoding="utf-8")
+
+            with patch("max_auth.SMS_CODE_FILE", code_file):
+                _prepare_for_sms_auth()
+                self.assertFalse(code_file.exists())
 
 
 if __name__ == "__main__":

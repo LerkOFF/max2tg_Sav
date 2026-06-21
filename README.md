@@ -1,181 +1,78 @@
 # Max2TG
 
-`Max2TG` — это двусторонний bridge между `MAX` и `Telegram Topics`.
+Two-way bridge between MAX and Telegram forum topics.
 
-В этом репозитории хранятся только bridge-специфичные файлы:
-- Telegram bot runtime
-- маппинг `Max chat <-> Telegram topic`
-- маппинг `Max message <-> Telegram message`
-- логика echo suppression, replay/rebuild topics, edit/delete propagation
-- процессная изоляция Max polling и Max SDK RPC от Telegram runtime
-- локальные скрипты запуска и авторизации
+This fork uses `maxapi-python` (`pymax`) from PyPI. It does not need a local
+`MaxAPI` checkout, `max_proto`, or a custom LibreSSL/GOST Python build.
 
-Протокольное ядро `MAX` сюда больше не вендорится.
+## Setup
 
-Есть 2 режима:
-- локальный запуск: bridge использует внешний checkout `MaxAPI`
-- Docker: образ сам клонирует `MaxAPI` на этапе сборки
-
-## Зависимость от MaxAPI
-
-Нужен отдельный клон репозитория `MaxAPI`.
-
-Рекомендуемый вариант:
+Install dependencies:
 
 ```bash
-cd ..
-git clone https://github.com/talifan/MaxAPI.git
+pip install -r requirements.txt
 ```
 
-Тогда структура будет такой:
-
-```text
-.../LLM_Activities/
-  max2tg/
-  MaxAPI/
-```
-
-Поддерживаются и другие варианты:
-- положить `MaxAPI` в `vendor/MaxAPI` внутри этого репозитория
-- положить `MaxAPI` в `external/MaxAPI`
-- задать `MAXAPI_REPO_PATH=/полный/путь/к/MaxAPI`
-
-Bridge автоматически ищет `MaxAPI` в этих местах через [maxapi_bootstrap.py](maxapi_bootstrap.py).
-
-## Что должно лежать в MaxAPI
-
-Нужен именно checkout репозитория `MaxAPI`, потому что bridge использует его:
-- `max_proto/`
-- `max_fresh_auth.py`
-- `max_sdk_cli.py`
-
-Минимально для runtime нужен `max_proto/`, но проще и надёжнее держать полный клон `MaxAPI`.
-
-## Установка
-
-1. Поставить Python-зависимости bridge:
-
-```bash
-pip install aiogram aiosqlite python-dotenv
-```
-
-2. Поставить зависимости `MaxAPI` в его checkout:
-
-```bash
-cd ../MaxAPI
-pip install lz4 msgpack
-```
-
-3. Вернуться в `max2tg` и создать `.env`:
+Create `.env`:
 
 ```env
 TG_BOT_TOKEN=...
 TG_GROUP_ID=-100...
-MAX_DEVICE_ID=+79...
+MAX_PHONE=+79990000000
+MAX_DEVICE_ID=max2tg-bridge
+MAX_SESSION_DIR=pymax
+MAX_SESSION_NAME=session.db
 ```
 
-4. Пройти авторизацию MAX:
+Authorize MAX once from an interactive terminal:
 
 ```bash
-python3 init_max.py
-python3 complete_max_auth.py 123456
+python init_max.py
 ```
 
-Bundle авторизации будет сохранён в `data/auth_bundle.json`.
+The script asks for the SMS code and stores the session in
+`data/pymax/session.db`.
+
+Run locally:
+
+```bash
+python main.py
+```
 
 ## Docker
 
-В Docker внешний checkout `../MaxAPI` на хосте не нужен.
-
-Текущий `docker-compose.yml` монтирует секреты и runtime-данные с хоста:
-- `.env` -> `/app/.env:ro`
-- `data/` -> `/app/data`
-- `logs/` -> `/app/logs`
-
-`Dockerfile` собирает отдельный Python с `LibreSSL 2.8.3` для GOST TLS и берёт `MaxAPI` из `vendor/MaxAPI` внутри build context:
-- копирует `vendor/MaxAPI` в `/opt/maxapi`
-- выставляет `MAXAPI_REPO_PATH=/opt/maxapi`
-- устанавливает зависимости bridge и `MaxAPI`
-
-Сборка:
+Build and run:
 
 ```bash
 docker compose build
-```
-
-Запуск:
-
-```bash
 docker compose up -d
 ```
 
-Логи:
+The compose file mounts:
 
-```bash
-tail -f logs/bridge.log
-```
+- `.env` to `/app/.env`
+- `data/` to `/app/data`
+- `logs/` to `/app/logs`
 
-По умолчанию `docker-compose.yml` тянет:
-- `MAXAPI_REPO=https://github.com/talifan/MaxAPI.git`
-- `MAXAPI_REF=main`
+Authorize MAX before starting the container, or run `python init_max.py` inside
+an interactive container with the same mounted `data/` directory.
 
-Если нужно собрать образ на другом ref:
+## Files
 
-```bash
-docker compose build \
-  --build-arg MAXAPI_REF=<branch-or-tag>
-```
+- `main.py` - Telegram bot, topic routing, message mapping.
+- `max_bridge.py` - compatibility adapter over `pymax.Client`.
+- `database.py` - SQLite mappings.
+- `init_max.py` - one-step MAX SMS authorization.
+- `check_chats.py` - prints visible MAX chats.
+- `README_BRIDGE.md` - runtime details and limits.
 
-## Запуск
+## Runtime Data
 
-```bash
-./scripts/start_bot.sh
-```
+Do not commit:
 
-Остановка:
-
-```bash
-./scripts/stop_bot.sh
-```
-
-## Структура этого репозитория
-
-- [main.py](main.py) — основной bridge и Telegram handlers
-- [max_bridge.py](max_bridge.py) — адаптер над внешним `MaxAPI`
-- [database.py](database.py) — SQLite mapping для чатов и сообщений
-- [rebuild_topics.py](rebuild_topics.py) — пересборка Telegram topics и controlled replay
-- [init_max.py](init_max.py) — запрос кода авторизации через внешний `MaxAPI`
-- [complete_max_auth.py](complete_max_auth.py) — завершение авторизации и сохранение bundle
-- [README_BRIDGE.md](README_BRIDGE.md) — подробная bridge-документация
-- [TODO.md](TODO.md) — текущий backlog
-
-## Что умеет bridge
-
-- `Max -> TG`: текст, фото, видео, файлы
-- `TG -> Max`: текст, фото, видео, документы
-- отдельные Telegram topics для чатов MAX
-- persistent message mapping
-- suppression эха
-- `Max -> TG` delete propagation
-- edit propagation:
-  - `TG -> Max`
-  - `Max -> TG`
-- устойчивый runtime в Docker:
-  - основной процесс `main.py` обслуживает Telegram и SQLite
-  - `max-sdk-worker` выполняет все SDK send/download/history вызовы в отдельном process
-  - `max-polling` слушает MAX events в отдельном process
-
-Реакции пока сознательно не включены в runtime.
-
-## Проверка MaxAPI bootstrap
-
-Быстрая проверка, что bridge видит внешний `MaxAPI`:
-
-```bash
-python3 - <<'PY'
-from maxapi_bootstrap import bootstrap_maxapi
-print(bootstrap_maxapi())
-PY
-```
-
-Если всё в порядке, вы увидите путь к checkout `MaxAPI` либо `None`, если `max_proto` уже доступен в `PYTHONPATH`.
+- `.env`
+- `data/pymax/`
+- `data/bridge.db`
+- `data/user_names.json`
+- `logs/`
+- `vendor/`

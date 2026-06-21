@@ -1,0 +1,4 @@
+aiogram
+aiosqlite
+python-dotenv
+maxapi-python==2.3.1

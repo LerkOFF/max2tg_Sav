@@ -1,39 +1,44 @@
 import asyncio
-import os
-from dotenv import load_dotenv
-from maxapi_bootstrap import bootstrap_maxapi
 
-bootstrap_maxapi()
+from config import MAX_DEVICE_ID, MAX_PHONE, MAX_SESSION_DIR, MAX_SESSION_NAME
 
-from max_proto import MaxAuthFlow
 
-load_dotenv()
+async def main() -> None:
+    if not MAX_PHONE:
+        raise RuntimeError("Set MAX_PHONE in .env, for example MAX_PHONE=+79990000000")
 
-async def init_auth():
-    phone = os.getenv("MAX_DEVICE_ID") # Берем номер из этой переменной, как вы указали
-    device_id = "max2tg-bridge" # ID устройства для Max
-    
-    if not phone or not phone.startswith("+"):
-        print(f"Ошибка: Номер телефона в .env (MAX_DEVICE_ID={phone}) некорректен. Должен быть +7...")
-        return
+    from pymax import Client, ExtraConfig
 
-    flow = MaxAuthFlow.create(device_id=device_id)
+    MAX_SESSION_DIR.mkdir(parents=True, exist_ok=True)
+    client = Client(
+        phone=MAX_PHONE,
+        session_name=MAX_SESSION_NAME,
+        work_dir=str(MAX_SESSION_DIR),
+        extra_config=ExtraConfig(device_id=MAX_DEVICE_ID, reconnect=False),
+    )
+
+    auth_completed = False
+
+    @client.on_start()
+    async def on_start(c):
+        nonlocal auth_completed
+        auth_completed = True
+        me = c.me
+        user_id = (
+            getattr(me, "id", None)
+            or getattr(me, "contact_id", None)
+            or getattr(me, "user_id", None)
+        ) if me is not None else None
+        print(f"MAX auth complete. user_id={user_id}, session={MAX_SESSION_DIR / MAX_SESSION_NAME}")
+        await c.stop()
+
+    session_path = MAX_SESSION_DIR / MAX_SESSION_NAME
     try:
-        print(f"Запрашиваю код подтверждения для {phone}...")
-        # request_code - синхронный метод в SDK
-        result = await asyncio.to_thread(flow.request_code, phone)
-        print(f"Код успешно отправлен!")
-        print(f"Verify Token: {result.verify_token}")
-        print("\nПОЖАЛУЙСТА, ПРИШЛИТЕ ПОЛУЧЕННЫЙ КОД ИЗ СМС.")
-        
-        # Сохраним токен во временный файл для второго шага
-        with open("data/verify_token.txt", "w") as f:
-            f.write(result.verify_token)
-            
-    except Exception as e:
-        print(f"Произошла ошибка при запросе кода: {e}")
+        await client.start()
+    except (asyncio.CancelledError, Exception):
+        if not auth_completed and not session_path.exists():
+            raise
+
 
 if __name__ == "__main__":
-    if not os.path.exists("data"):
-        os.makedirs("data")
-    asyncio.run(init_auth())
+    asyncio.run(main())

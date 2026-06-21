@@ -13,13 +13,16 @@ from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError, Telegra
 from aiogram.types import Message, FSInputFile, ReactionTypeEmoji
 from config import CHAT_RECONCILE_INTERVAL_SECONDS, TG_BOT_TOKEN, TG_GROUP_ID, TG_POLLING_TIMEOUT
 from database import BridgeDB
-from maxapi_bootstrap import bootstrap_maxapi
-
-bootstrap_maxapi()
-
-from max_bridge import MaxBridge
-from max_proto import MaxContactEvent, MaxDeleteEvent, MaxEvent, MaxMessageEvent, MaxReactionEvent
-from max_proto.media import download_to_file, suggested_photo_name
+from max_bridge import (
+    MaxBridge,
+    MaxContactEvent,
+    MaxDeleteEvent,
+    MaxEvent,
+    MaxMessageEvent,
+    MaxReactionEvent,
+    download_to_file,
+    suggested_photo_name,
+)
 
 LOG_PATH = Path(os.getenv("BRIDGE_LOG_PATH", "logs/bridge.log"))
 FAULT_LOG_PATH = Path(os.getenv("BRIDGE_FAULT_LOG_PATH", "logs/faulthandler.log"))
@@ -1839,10 +1842,11 @@ async def reconcile_chats_forever(interval_seconds: int = CHAT_RECONCILE_INTERVA
 async def start_max_runtime_forever() -> None:
     while True:
         if await asyncio.to_thread(max_bridge.load_sdk):
+            asyncio.create_task(max_bridge.start_polling())
+            await max_bridge.wait_ready()
             await sync(verbose=True)
             chat_ids = await load_mapped_chat_ids()
             logger.info("Prepared %s chats for Max subscription", len(chat_ids))
-            asyncio.create_task(max_bridge.start_polling(chat_ids=chat_ids))
             await backfill_existing_topics()
             asyncio.create_task(reconcile_chats_forever())
             asyncio.create_task(sync_recent_message_states_forever())

@@ -1,526 +1,502 @@
 from __future__ import annotations
+
 import asyncio
-import concurrent.futures
-import itertools
-import logging
-import multiprocessing
+import mimetypes
 import os
-import queue
-import time
-from typing import Any, Callable
-import msgpack
-from config import AUTH_BUNDLE_PATH
-from maxapi_bootstrap import bootstrap_maxapi
+import re
+import shutil
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
-bootstrap_maxapi()
-
-from max_proto import MaxEvent, MaxPollingClient, MaxPollingRunner, MaxSdk
-from max_proto.packet import MaxPacket
-
-logger = logging.getLogger(__name__)
+from config import DATA_DIR, MAX_DEVICE_ID, MAX_PHONE, MAX_SESSION_DIR, MAX_SESSION_NAME
 
 
-def _close_polling_client_without_ssl_shutdown(self: MaxPollingClient) -> None:
-    tls = self.tls
-    if tls is None:
-        return
-    self.tls = None
+@dataclass
+class MaxMessageEvent:
+    chat_id: int | None
+    message_id: int | None
+    message: dict | None
+
+
+@dataclass
+class MaxDeleteEvent:
+    chat_id: int | None
+    message_ids: list[int]
+
+
+@dataclass
+class MaxReactionEvent:
+    chat_id: int | None
+    message_id: int | None
+    reaction_info: dict | None
+
+
+@dataclass
+class MaxContactEvent:
+    contact: dict
+
+
+MaxEvent = MaxMessageEvent | MaxDeleteEvent | MaxReactionEvent | MaxContactEvent
+
+
+def _load_pymax():
     try:
-        fd = tls.detach()
-    except OSError:
-        fd = -1
-    if fd >= 0:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
+        from pymax import Client, ExtraConfig, File, Photo, Video
+    except ImportError as exc:
+        raise RuntimeError(
+            "maxapi-python is not installed. Run: python -m pip install maxapi-python"
+        ) from exc
+    return Client, ExtraConfig, File, Photo, Video
 
 
-MaxPollingClient.close = _close_polling_client_without_ssl_shutdown
+def _dump_model(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return {_normalize_key(k): _dump_model(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_dump_model(item) for item in value]
+    if hasattr(value, "model_dump"):
+        data = value.model_dump(by_alias=True, mode="json")
+        return _dump_model(data)
+    return value
 
 
-def _max_polling_process_main(
-    auth_bundle_path: str,
-    chat_ids: list[int],
-    command_queue: multiprocessing.Queue,
-    event_queue: multiprocessing.Queue,
-) -> None:
-    logger = logging.getLogger(__name__)
-    subscribed_chat_ids = set(chat_ids)
-
-    def client_factory():
-        polling_sdk = MaxSdk.from_auth_bundle(auth_bundle_path)
-        return polling_sdk.create_polling_client()
-
-    runner = MaxPollingRunner(
-        client_factory=client_factory,
-        chat_ids=subscribed_chat_ids,
-        poll_timeout=10.0,
-        max_events=5,
-        idle_ping_interval=60.0,
-    )
-
-    def apply_pending_commands() -> None:
-        while True:
-            try:
-                command, value = command_queue.get_nowait()
-            except queue.Empty:
-                return
-            if command == "stop":
-                runner.stop()
-                return
-            if command == "add_chat":
-                try:
-                    runner.add_chat(int(value))
-                except (TypeError, ValueError):
-                    logger.warning("Ignoring invalid Max chat subscription command value=%r", value)
-
-    def on_event(event: MaxEvent) -> None:
-        apply_pending_commands()
-        event_queue.put(("event", event))
-
-    def on_error(exc: Exception) -> None:
-        apply_pending_commands()
-        event_queue.put(("error", repr(exc)))
-
-    try:
-        runner.run_forever(on_event, on_error=on_error)
-        event_queue.put(("stopped", None))
-    except BaseException as exc:
-        event_queue.put(("crash", repr(exc)))
-        raise
+def _normalize_key(key: Any) -> Any:
+    if not isinstance(key, str):
+        return key
+    aliases = {
+        "chatId": "chatId",
+        "sender": "sender",
+        "senderId": "senderId",
+        "lastMessage": "lastMessage",
+        "reactionInfo": "reactionInfo",
+        "baseUrl": "baseUrl",
+        "photoToken": "photoToken",
+        "photoId": "photoId",
+        "videoId": "videoId",
+        "fileId": "fileId",
+        "audioId": "audioId",
+        "lottieUrl": "lottieUrl",
+        "baseRawIconUrl": "baseRawIconUrl",
+        "baseIconUrl": "baseIconUrl",
+    }
+    return aliases.get(key, key)
 
 
-def _max_sdk_worker_process_main(
-    auth_bundle_path: str,
-    request_queue: multiprocessing.Queue,
-    response_queue: multiprocessing.Queue,
-) -> None:
-    sdk = MaxSdk.from_auth_bundle(auth_bundle_path)
+def _camel_aliases(value: Any) -> Any:
+    if isinstance(value, list):
+        return [_camel_aliases(item) for item in value]
+    if not isinstance(value, dict):
+        return value
 
-    while True:
-        request = request_queue.get()
-        if not isinstance(request, tuple) or len(request) != 5:
-            continue
+    out: dict[Any, Any] = {}
+    for key, raw in value.items():
+        new_key = _snake_to_camel(key) if isinstance(key, str) else key
+        out[new_key] = _camel_aliases(raw)
+    if "type" in out and "_type" not in out:
+        out["_type"] = str(out["type"]).upper()
+    if "sender" in out and "senderId" not in out:
+        out["senderId"] = out["sender"]
+    if "lastMessage" not in out and "last_message" in value:
+        out["lastMessage"] = _camel_aliases(value["last_message"])
+    if "reactionInfo" not in out and "reaction_info" in value:
+        out["reactionInfo"] = _camel_aliases(value["reaction_info"])
+    return out
 
-        request_id, command, func_name, args, kwargs = request
-        if command == "stop":
-            response_queue.put((request_id, True, None))
-            return
 
-        try:
-            if command == "sdk":
-                func = getattr(sdk, func_name)
-                result = func(*args, **kwargs)
-            elif command == "client":
-                func = getattr(sdk._client, func_name)
-                result = func(*args, **kwargs)
-            elif command == "bridge" and func_name == "get_contacts_by_ids":
-                contact_ids = [int(item) for item in args[0] if item is not None]
-                payload = msgpack.packb({"contactIds": contact_ids}, use_bin_type=True)
-                packet = MaxPacket.build(
-                    opcode=32,
-                    payload=payload,
-                    seq=sdk._client.standalone.session.next_seq(),
-                )
-                result = sdk._client.transact(packet)["response"]
-            else:
-                raise ValueError(f"Unknown SDK worker command: {command}")
-            response_queue.put((request_id, True, result))
-        except BaseException as exc:
-            response_queue.put((request_id, False, repr(exc)))
+def _snake_to_camel(key: str) -> str:
+    parts = key.split("_")
+    if len(parts) == 1:
+        return key
+    return parts[0] + "".join(part[:1].upper() + part[1:] for part in parts[1:])
+
+
+def _message_to_dict(message: Any) -> dict:
+    data = _camel_aliases(_dump_model(message) or {})
+    if "id" in data:
+        data["id"] = int(data["id"])
+    if "chatId" in data and "chat_id" not in data:
+        data["chat_id"] = data["chatId"]
+    return data
+
+
+def _chat_to_dict(chat: Any) -> dict:
+    data = _camel_aliases(_dump_model(chat) or {})
+    if "lastMessage" not in data and isinstance(data.get("last_message"), dict):
+        data["lastMessage"] = data["last_message"]
+    return data
+
+
+def _reaction_to_dict(reaction_info: Any) -> dict | None:
+    if reaction_info is None:
+        return None
+    return _camel_aliases(_dump_model(reaction_info) or {})
+
+
+def suggested_photo_name(chat_id: int, message_id: int, content_type: str | None = None) -> str:
+    ext = mimetypes.guess_extension(content_type or "") or ".jpg"
+    if ext == ".jpe":
+        ext = ".jpg"
+    return f"max_{chat_id}_{message_id}{ext}"
+
+
+def download_to_file(url: str, output: Path | str) -> tuple[Path, str | None]:
+    output_path = Path(output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    request = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urlopen(request, timeout=120) as response:
+        content_type = response.headers.get("content-type")
+        with output_path.open("wb") as fh:
+            shutil.copyfileobj(response, fh)
+    return output_path, content_type
 
 
 class MaxBridge:
-    def __init__(self, auth_bundle_path: str = str(AUTH_BUNDLE_PATH)):
-        self.auth_bundle_path = auth_bundle_path
-        self.sdk: MaxSdk | None = None
-        self.is_running = False
+    def __init__(self, on_event=None):
+        self.on_event = on_event
         self.login_payload: dict[str, Any] | None = None
-        self._on_event_callback: Callable[[MaxEvent], asyncio.Future] | None = None
-        self._subscribed_chat_ids: set[int] = set()
-        self._pending_chat_ids: set[int] = set()
-        self._sdk_response_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1,
-            thread_name_prefix="max-sdk-rpc",
-        )
-        self._mp_context = multiprocessing.get_context("spawn")
-        self._sdk_process: multiprocessing.Process | None = None
-        self._sdk_request_queue: multiprocessing.Queue | None = None
-        self._sdk_response_queue: multiprocessing.Queue | None = None
-        self._sdk_rpc_lock: asyncio.Lock | None = None
-        self._sdk_request_ids = itertools.count(1)
-        self._poll_process: multiprocessing.Process | None = None
-        self._poll_command_queue: multiprocessing.Queue | None = None
-        self._poll_event_queue: multiprocessing.Queue | None = None
+        self.client: Any | None = None
+        self._ready = asyncio.Event()
+        self._polling_started = False
 
-    def set_on_event(self, callback: Callable[[MaxEvent], asyncio.Future]):
-        self._on_event_callback = callback
+    @property
+    def session_path(self) -> Path:
+        return MAX_SESSION_DIR / MAX_SESSION_NAME
 
     def is_authorized(self) -> bool:
-        return AUTH_BUNDLE_PATH.exists()
+        return self.session_path.exists()
 
-    def load_sdk(self):
+    def _make_client(self, *, reconnect: bool = True):
+        Client, ExtraConfig, *_ = _load_pymax()
+        if not MAX_PHONE:
+            raise RuntimeError("MAX_PHONE is required for maxapi-python.")
+        MAX_SESSION_DIR.mkdir(parents=True, exist_ok=True)
+        return Client(
+            phone=MAX_PHONE,
+            session_name=MAX_SESSION_NAME,
+            work_dir=str(MAX_SESSION_DIR),
+            extra_config=ExtraConfig(device_id=MAX_DEVICE_ID, reconnect=reconnect),
+        )
+
+    def load_sdk(self) -> bool:
         if not self.is_authorized():
             return False
+        return True
 
-        self._start_sdk_process()
-        try:
-            self.login_payload = self._rpc_sdk_call_sync("sdk", "login", (), {})
-            logger.info("Max SDK authorized and logged in.")
-            return True
-        except Exception as e:
-            logger.error("Failed to login with existing bundle: %s", e)
-            self._stop_sdk_process()
-            return False
+    async def _on_started(self, client: Any) -> None:
+        self.client = client
+        self.login_payload = {
+            "profile": _camel_aliases(_dump_model(client.me) or {}),
+            "contacts": [_camel_aliases(_dump_model(c) or {}) for c in (client.contacts or []) if c],
+            "chats": [_chat_to_dict(c) for c in (client.chats or [])],
+        }
+        self._ready.set()
 
-    async def _run_sdk_call(self, func_name: str, *args, **kwargs):
-        return await self._rpc_sdk_call("sdk", func_name, args, kwargs)
+    async def start_polling(self, chat_ids: list[int] | None = None):
+        if self._polling_started:
+            return
+        self._polling_started = True
+        client = self._make_client(reconnect=True)
 
-    async def _run_sdk_client_call(self, func_name: str, *args, **kwargs):
-        return await self._rpc_sdk_call("client", func_name, args, kwargs)
+        @client.on_start()
+        async def _started(c):
+            await self._on_started(c)
 
-    async def get_contacts_by_ids(self, contact_ids: list[int]) -> list[dict]:
-        unique_ids = sorted({int(item) for item in contact_ids if item is not None})
-        if not unique_ids:
-            return []
-        response = await self._rpc_sdk_call("bridge", "get_contacts_by_ids", (unique_ids,), {})
-        contacts = response.get("contacts") if isinstance(response, dict) else None
-        return contacts if isinstance(contacts, list) else []
+        @client.on_message()
+        async def _message(message, c):
+            msg = _message_to_dict(message)
+            event = MaxMessageEvent(
+                chat_id=message.chat_id,
+                message_id=int(message.id) if message.id is not None else None,
+                message=msg,
+            )
+            await self._dispatch(event)
+
+        @client.on_message_edit()
+        async def _message_edit(message, c):
+            msg = _message_to_dict(message)
+            event = MaxMessageEvent(
+                chat_id=message.chat_id,
+                message_id=int(message.id) if message.id is not None else None,
+                message=msg,
+            )
+            await self._dispatch(event)
+
+        @client.on_message_delete()
+        async def _message_delete(event, c):
+            await self._dispatch(
+                MaxDeleteEvent(
+                    chat_id=getattr(event, "chat_id", None),
+                    message_ids=[int(mid) for mid in (getattr(event, "message_ids", []) or [])],
+                )
+            )
+
+        @client.on_reaction_update()
+        async def _reaction(event, c):
+            await self._dispatch(
+                MaxReactionEvent(
+                    chat_id=getattr(event, "chat_id", None),
+                    message_id=int(event.message_id) if getattr(event, "message_id", None) else None,
+                    reaction_info={
+                        "counters": _camel_aliases(_dump_model(getattr(event, "counters", [])) or []),
+                        "totalCount": getattr(event, "total_count", 0),
+                    },
+                )
+            )
+
+        await client.start()
+
+    async def _dispatch(self, event: MaxEvent) -> None:
+        if self.on_event is None:
+            return
+        result = self.on_event(event)
+        if asyncio.iscoroutine(result):
+            await result
+
+    async def _get_client(self):
+        if self.client is None:
+            await asyncio.wait_for(self._ready.wait(), timeout=60)
+        if self.client is None:
+            raise RuntimeError("Max client is not ready")
+        return self.client
+
+    async def ensure_chat_subscription(self, chat_id: int) -> bool:
+        return True
+
+    async def wait_ready(self, timeout: float = 60) -> None:
+        await asyncio.wait_for(self._ready.wait(), timeout=timeout)
 
     def get_login_chats(self) -> list[dict]:
-        if not isinstance(self.login_payload, dict):
-            return []
-        chats = self.login_payload.get("chats")
+        payload = self.login_payload if isinstance(self.login_payload, dict) else {}
+        chats = payload.get("chats")
         return chats if isinstance(chats, list) else []
 
     def get_login_contacts(self) -> list[dict]:
-        if not isinstance(self.login_payload, dict):
-            return []
-        contacts = self.login_payload.get("contacts")
+        payload = self.login_payload if isinstance(self.login_payload, dict) else {}
+        contacts = payload.get("contacts")
         return contacts if isinstance(contacts, list) else []
 
     def get_own_contact_id(self) -> int | None:
-        if not isinstance(self.login_payload, dict):
-            return None
-        profile = self.login_payload.get("profile")
+        payload = self.login_payload if isinstance(self.login_payload, dict) else {}
+        profile = payload.get("profile") if isinstance(payload, dict) else None
         if not isinstance(profile, dict):
             return None
-        contact = profile.get("contact")
-        if not isinstance(contact, dict):
-            return None
-        contact_id = contact.get("id")
-        return int(contact_id) if contact_id is not None else None
+        value = profile.get("id") or profile.get("contactId") or profile.get("userId")
+        return int(value) if value is not None else None
 
-    async def start_polling(self, chat_ids: list[int] | None = None):
-        self.is_running = True
-        self._subscribed_chat_ids = set(chat_ids or [])
-        logger.info("Starting Max polling...")
-        reconnect_delay = 1.0
+    async def get_contacts_by_ids(self, contact_ids: list[int]) -> list[dict]:
+        client = await self._get_client()
+        contacts = await client.get_users([int(cid) for cid in contact_ids])
+        return [_camel_aliases(_dump_model(contact) or {}) for contact in contacts if contact]
 
-        while self.is_running:
-            if not self.is_authorized():
-                logger.error("Auth bundle is missing. Retrying Max polling startup in %.1fs", reconnect_delay)
-                await asyncio.sleep(reconnect_delay)
-                reconnect_delay = min(reconnect_delay * 2, 30.0)
-                continue
-
-            try:
-                self._start_poll_process()
-                await self._consume_poll_events()
-            except asyncio.CancelledError:
-                self.is_running = False
-                self._stop_poll_process()
-                raise
-            except Exception:
-                logger.exception("Max polling supervisor failed; restarting polling process")
-            finally:
-                exitcode = self._stop_poll_process()
-                if self.is_running:
-                    logger.warning("Max polling process exited with code %s; restarting", exitcode)
-
-            if not self.is_running:
-                break
-            await asyncio.sleep(reconnect_delay)
-            reconnect_delay = min(reconnect_delay * 2, 30.0)
-
-    async def ensure_chat_subscription(self, chat_id: int) -> bool:
-        if chat_id in self._subscribed_chat_ids or chat_id in self._pending_chat_ids:
-            return False
-        self._pending_chat_ids.add(chat_id)
-        if self._poll_command_queue:
-            self._poll_command_queue.put(("add_chat", chat_id))
-            self._subscribed_chat_ids.add(chat_id)
-            self._pending_chat_ids.discard(chat_id)
-        logger.info("Queued subscription for Max chat %s", chat_id)
-        return True
-
-    def _start_sdk_process(self) -> None:
-        if self._sdk_process is not None and self._sdk_process.is_alive():
-            return
-
-        self._stop_sdk_process()
-        self._sdk_request_queue = self._mp_context.Queue()
-        self._sdk_response_queue = self._mp_context.Queue()
-        self._sdk_process = self._mp_context.Process(
-            target=_max_sdk_worker_process_main,
-            args=(
-                self.auth_bundle_path,
-                self._sdk_request_queue,
-                self._sdk_response_queue,
-            ),
-            name="max-sdk-worker",
-            daemon=True,
-        )
-        self._sdk_process.start()
-
-    def _stop_sdk_process(self) -> int | None:
-        process = self._sdk_process
-        request_queue = self._sdk_request_queue
-        response_queue = self._sdk_response_queue
-        self._sdk_process = None
-        self._sdk_request_queue = None
-        self._sdk_response_queue = None
-
-        if request_queue is not None:
-            try:
-                request_queue.put_nowait((0, "stop", "", (), {}))
-            except Exception:
-                pass
-
-        exitcode = None
-        if process is not None:
-            process.join(timeout=5)
-            if process.is_alive():
-                process.terminate()
-                process.join(timeout=5)
-            exitcode = process.exitcode
-
-        for mp_queue in (request_queue, response_queue):
-            if mp_queue is None:
-                continue
-            try:
-                mp_queue.close()
-            except Exception:
-                pass
-
-        return exitcode
-
-    def _rpc_sdk_call_sync(
-        self,
-        command: str,
-        func_name: str,
-        args: tuple,
-        kwargs: dict,
-        *,
-        timeout: float = 180.0,
-    ):
-        self._start_sdk_process()
-        process = self._sdk_process
-        request_queue = self._sdk_request_queue
-        response_queue = self._sdk_response_queue
-        if process is None or request_queue is None or response_queue is None:
-            raise RuntimeError("Max SDK worker process is not available")
-
-        request_id = next(self._sdk_request_ids)
-        request_queue.put((request_id, command, func_name, args, kwargs))
-        deadline = time.monotonic() + timeout
-
-        while True:
-            if process.exitcode is not None:
-                raise RuntimeError(f"Max SDK worker exited with code {process.exitcode}")
-            try:
-                response_id, success, payload = response_queue.get(timeout=1.0)
-            except queue.Empty:
-                if time.monotonic() >= deadline:
-                    raise TimeoutError(f"Max SDK worker call timed out: {func_name}")
-                continue
-            if response_id != request_id:
-                continue
-            if success:
-                return payload
-            raise RuntimeError(f"Max SDK worker call failed: {payload}")
-
-    async def _rpc_sdk_call(
-        self,
-        command: str,
-        func_name: str,
-        args: tuple,
-        kwargs: dict,
-        *,
-        timeout: float = 180.0,
-    ):
-        if self._sdk_rpc_lock is None:
-            self._sdk_rpc_lock = asyncio.Lock()
-
-        async with self._sdk_rpc_lock:
-            try:
-                return await asyncio.wait_for(
-                    asyncio.to_thread(
-                        self._rpc_sdk_call_sync,
-                        command,
-                        func_name,
-                        args,
-                        kwargs,
-                        timeout=timeout,
-                    ),
-                    timeout=timeout + 5,
-                )
-            except RuntimeError as exc:
-                if "Max SDK worker exited with code" not in str(exc):
-                    raise
-                logger.warning("Restarting Max SDK worker after crash during %s.%s", command, func_name)
-                self._stop_sdk_process()
-                self._start_sdk_process()
-                if func_name != "login":
-                    self.login_payload = await asyncio.wait_for(
-                        asyncio.to_thread(
-                            self._rpc_sdk_call_sync,
-                            "sdk",
-                            "login",
-                            (),
-                            {},
-                            timeout=timeout,
-                        ),
-                        timeout=timeout + 5,
-                    )
-                return await asyncio.wait_for(
-                    asyncio.to_thread(
-                        self._rpc_sdk_call_sync,
-                        command,
-                        func_name,
-                        args,
-                        kwargs,
-                        timeout=timeout,
-                    ),
-                    timeout=timeout + 5,
-                )
-
-    def _start_poll_process(self) -> None:
-        self._poll_command_queue = self._mp_context.Queue()
-        self._poll_event_queue = self._mp_context.Queue(maxsize=1000)
-        self._poll_process = self._mp_context.Process(
-            target=_max_polling_process_main,
-            args=(
-                self.auth_bundle_path,
-                sorted(self._subscribed_chat_ids | self._pending_chat_ids),
-                self._poll_command_queue,
-                self._poll_event_queue,
-            ),
-            name="max-polling",
-            daemon=True,
-        )
-        self._pending_chat_ids.clear()
-        self._poll_process.start()
-
-    def _stop_poll_process(self) -> int | None:
-        process = self._poll_process
-        command_queue = self._poll_command_queue
-        event_queue = self._poll_event_queue
-        self._poll_process = None
-        self._poll_command_queue = None
-        self._poll_event_queue = None
-
-        if command_queue is not None:
-            try:
-                command_queue.put_nowait(("stop", None))
-            except Exception:
-                pass
-
-        exitcode = None
-        if process is not None:
-            process.join(timeout=5)
-            if process.is_alive():
-                process.terminate()
-                process.join(timeout=5)
-            exitcode = process.exitcode
-
-        for mp_queue in (command_queue, event_queue):
-            if mp_queue is None:
-                continue
-            try:
-                mp_queue.close()
-            except Exception:
-                pass
-
-        return exitcode
-
-    async def _consume_poll_events(self) -> None:
-        event_queue = self._poll_event_queue
-        process = self._poll_process
-        if event_queue is None or process is None:
-            raise RuntimeError("Max polling process was not started")
-
-        while self.is_running:
-            if process.exitcode is not None:
-                return
-            try:
-                item_type, payload = await asyncio.to_thread(event_queue.get, True, 1.0)
-            except queue.Empty:
-                continue
-
-            if item_type == "event":
-                event = payload
-                opcode = event.header.opcode
-                if opcode not in (1, 292):
-                    logger.info("Max event received: opcode=%s kind=%s", opcode, event.kind)
-                if self._on_event_callback:
-                    await self._on_event_callback(event)
-            elif item_type == "error":
-                logger.error("Error in Max polling process: %s", payload)
-            elif item_type == "crash":
-                logger.error("Max polling process crashed: %s", payload)
-                return
-            elif item_type == "stopped":
-                return
-
-    async def send_text(self, chat_id: int, text: str):
-        return await self._run_sdk_call("send_text", chat_id=chat_id, text=text)
+    async def list_chats(self) -> list[dict]:
+        client = await self._get_client()
+        chats = await client.fetch_chats()
+        return [_chat_to_dict(chat) for chat in (chats or [])]
 
     async def get_chat_info(self, chat_id: int):
-        return await self._run_sdk_call("get_chat_info", chat_id=chat_id)
+        client = await self._get_client()
+        return _chat_to_dict(await client.get_chat(int(chat_id)))
 
     async def get_message(self, chat_id: int, message_id: int):
-        return await self._run_sdk_call("get_message", chat_id, message_id)
+        client = await self._get_client()
+        message = await client.get_message(int(chat_id), int(message_id))
+        return _message_to_dict(message) if message else None
 
     async def get_last_message(self, chat_id: int):
-        return await self._run_sdk_call("get_last_message", chat_id)
+        history = await self.get_chat_history(chat_id=chat_id, count=1)
+        messages = history.get("messages", [])
+        return messages[0] if messages else None
 
     async def get_chat_history(self, **kwargs):
-        return await self._run_sdk_call("get_chat_history", **kwargs)
+        client = await self._get_client()
+        chat_id = int(kwargs["chat_id"])
+        count = int(kwargs.get("count") or kwargs.get("backward") or 40)
+        from_time = kwargs.get("from_time")
+        messages = await client.fetch_history(
+            chat_id=chat_id,
+            backward=count,
+            forward=0,
+            from_time=from_time,
+            get_chat=bool(kwargs.get("get_chat", False)),
+            get_messages=bool(kwargs.get("get_messages", True)),
+        )
+        converted = [_message_to_dict(message) for message in (messages or [])]
+        converted.sort(key=lambda item: int(item.get("time") or 0), reverse=True)
+        return {"messages": converted}
 
     async def get_reactions(self, chat_id: int, message_ids: list[int]):
-        return await self._run_sdk_call("get_reactions", chat_id, message_ids)
+        client = await self._get_client()
+        raw = await client.get_reactions(int(chat_id), [str(mid) for mid in message_ids])
+        return {
+            "messagesReactions": {
+                str(mid): _reaction_to_dict(info)
+                for mid, info in (raw or {}).items()
+            }
+        }
 
-    async def list_chats(self):
-        return await self._run_sdk_call("list_chats")
-
-    async def download_photo(self, **kwargs):
-        return await self._run_sdk_client_call("download_photo", **kwargs)
-
-    async def download_video(self, **kwargs):
-        return await self._run_sdk_client_call("download_video", **kwargs)
-
-    async def resolve_video_urls(self, **kwargs):
-        return await self._run_sdk_client_call("resolve_video_urls", **kwargs)
-
-    async def download_audio(self, **kwargs):
-        return await self._run_sdk_client_call("download_audio", **kwargs)
-
-    async def download_file(self, **kwargs):
-        return await self._run_sdk_client_call("download_file", **kwargs)
-
-    async def download_sticker(self, **kwargs):
-        return await self._run_sdk_client_call("download_sticker", **kwargs)
+    async def send_text(self, chat_id: int, text: str, **kwargs):
+        client = await self._get_client()
+        reply_to = kwargs.get("reply_to")
+        message = await client.send_message(int(chat_id), text or "", reply_to=reply_to)
+        return _message_to_dict(message) if message else None
 
     async def send_local_photo(self, **kwargs):
-        return await self._run_sdk_call("send_local_photo", **kwargs)
+        return await self._send_local_attachment("photo", **kwargs)
 
     async def send_local_video(self, **kwargs):
-        return await self._run_sdk_call("send_local_video", **kwargs)
+        return await self._send_local_attachment("video", **kwargs)
 
     async def send_local_file(self, **kwargs):
-        return await self._run_sdk_call("send_local_file", **kwargs)
+        return await self._send_local_attachment("file", **kwargs)
 
-    async def edit_message(self, **kwargs):
-        return await self._run_sdk_call("edit_message", **kwargs)
+    async def _send_local_attachment(self, kind: str, **kwargs):
+        client = await self._get_client()
+        _, _, File, Photo, Video = _load_pymax()
+        path = kwargs.get("path") or kwargs.get("file_path") or kwargs.get("input_path")
+        if not path:
+            raise ValueError("path is required")
+        caption = kwargs.get("text") or kwargs.get("caption") or ""
+        chat_id = int(kwargs["chat_id"])
+        reply_to = kwargs.get("reply_to")
+        cls = {"photo": Photo, "video": Video, "file": File}[kind]
+        message = await client.send_message(
+            chat_id=chat_id,
+            text=caption,
+            reply_to=reply_to,
+            attachments=[cls(path=str(path))],
+        )
+        return _message_to_dict(message) if message else None
+
+    async def edit_message(self, chat_id: int, message_id: int, text: str, **kwargs):
+        client = await self._get_client()
+        message = await client.edit_message(int(chat_id), int(message_id), text or "")
+        return _message_to_dict(message) if message else None
+
+    async def download_photo(self, **kwargs):
+        attach = await self._select_attachment(kwargs, "PHOTO")
+        url = attach.get("baseUrl") or attach.get("url")
+        if not url:
+            raise RuntimeError("PHOTO attachment does not contain a download URL")
+        return await self._download_url(url, kwargs, default_ext=".jpg")
+
+    async def resolve_video_urls(self, **kwargs):
+        attach = await self._select_attachment(kwargs, "VIDEO")
+        url = attach.get("url")
+        if not url:
+            client = await self._get_client()
+            video_id = attach.get("videoId")
+            if video_id is not None:
+                data = await client.get_video_by_id(
+                    int(kwargs["chat_id"]),
+                    int(kwargs["message_id"]),
+                    int(video_id),
+                )
+                video_data = _camel_aliases(_dump_model(data) or {})
+                url = video_data.get("url")
+        return {"selected_url": url, "external_url": url, "sources": {"MP4": url} if url else {}}
+
+    async def download_video(self, **kwargs):
+        urls = await self.resolve_video_urls(**kwargs)
+        url = urls.get("selected_url")
+        if not url:
+            raise RuntimeError("VIDEO attachment does not contain a download URL")
+        result = await self._download_url(url, kwargs, default_ext=".mp4")
+        result.update(urls)
+        return result
+
+    async def download_audio(self, **kwargs):
+        attach = await self._select_attachment(kwargs, "AUDIO")
+        url = attach.get("url")
+        if not url:
+            raise RuntimeError("AUDIO attachment does not contain a download URL")
+        return await self._download_url(url, kwargs, default_ext=".mp3")
+
+    async def download_file(self, **kwargs):
+        attach = await self._select_attachment(kwargs, "FILE")
+        url = attach.get("url")
+        if not url:
+            client = await self._get_client()
+            file_id = attach.get("fileId")
+            if file_id is not None:
+                data = await client.get_file_by_id(
+                    int(kwargs["chat_id"]),
+                    int(kwargs["message_id"]),
+                    int(file_id),
+                )
+                file_data = _camel_aliases(_dump_model(data) or {})
+                url = file_data.get("url")
+        if not url:
+            raise RuntimeError("FILE attachment does not contain a download URL")
+        result = await self._download_url(url, kwargs, default_name=attach.get("name"))
+        result["name"] = attach.get("name") or Path(result["saved_path"]).name
+        return result
+
+    async def download_sticker(self, **kwargs):
+        attach = await self._select_attachment(kwargs, "STICKER")
+        result: dict[str, str] = {}
+        if attach.get("url"):
+            preview = await self._download_url(attach["url"], kwargs, default_ext=".webp")
+            result["preview_path"] = preview["saved_path"]
+        if attach.get("lottieUrl"):
+            lottie = await self._download_url(attach["lottieUrl"], kwargs, default_ext=".json")
+            result["lottie_json_path"] = lottie["saved_path"]
+        if not result:
+            raise RuntimeError("STICKER attachment does not contain a download URL")
+        return result
+
+    async def _select_attachment(self, kwargs: dict, expected_type: str) -> dict:
+        attach = kwargs.get("attach")
+        if isinstance(attach, dict):
+            return attach
+        message = await self.get_message(int(kwargs["chat_id"]), int(kwargs["message_id"]))
+        attaches = message.get("attaches", []) if isinstance(message, dict) else []
+        candidates = [
+            item
+            for item in attaches
+            if isinstance(item, dict) and (item.get("_type") == expected_type or item.get("type") == expected_type)
+        ]
+        index = int(kwargs.get("attach_index") or 0)
+        if index >= len(candidates):
+            raise IndexError(f"{expected_type} attachment index {index} is out of range")
+        return candidates[index]
+
+    async def _download_url(
+        self,
+        url: str,
+        kwargs: dict,
+        *,
+        default_ext: str = "",
+        default_name: str | None = None,
+    ) -> dict:
+        path = self._media_path(url, kwargs, default_ext=default_ext, default_name=default_name)
+        saved_path, content_type = await asyncio.to_thread(download_to_file, url, path)
+        return {
+            "saved_path": str(saved_path),
+            "content_type": content_type,
+            "external_url": url,
+        }
+
+    def _media_path(
+        self,
+        url: str,
+        kwargs: dict,
+        *,
+        default_ext: str = "",
+        default_name: str | None = None,
+    ) -> Path:
+        chat_id = kwargs.get("chat_id", "chat")
+        message_id = kwargs.get("message_id", "message")
+        attach_index = kwargs.get("attach_index", 0)
+        url_name = Path(urlparse(url).path).name
+        name = default_name or url_name
+        if not name:
+            name = f"max_{chat_id}_{message_id}_{attach_index}{default_ext}"
+        name = re.sub(r"[^A-Za-z0-9._-]+", "_", name)
+        if "." not in name and default_ext:
+            name += default_ext
+        return DATA_DIR / name

@@ -1,73 +1,71 @@
 # Bridge Notes
 
-## Как bridge находит MaxAPI
+## MAX runtime
 
-Bridge не хранит `max_proto` внутри этого репозитория.
+This fork uses the PyPI package `maxapi-python` (`pymax`). A local `MaxAPI`
+checkout, `max_proto`, LibreSSL/GOST build, and `MAXAPI_REPO_PATH` are no longer
+required.
 
-Поиск внешнего checkout идёт в таком порядке:
-1. `MAXAPI_REPO_PATH`
-2. `vendor/MaxAPI`
-3. `external/MaxAPI`
-4. `../MaxAPI`
-5. `../maxapi`
+Authorization is stored by `pymax` as SQLite session data:
 
-Логика лежит в [maxapi_bootstrap.py](maxapi_bootstrap.py).
+- `data/pymax/session.db` by default
+- configurable through `MAX_SESSION_DIR` and `MAX_SESSION_NAME`
 
-В Docker это упрощено:
-- образ кладёт `vendor/MaxAPI` в `/opt/maxapi`
-- `MAXAPI_REPO_PATH=/opt/maxapi` выставляется в `Dockerfile`
-- внешний checkout на хосте контейнеру не нужен
+Run initial authorization from an interactive terminal:
 
-## Runtime-архитектура
+```bash
+python init_max.py
+```
 
-В контейнере bridge работает в 3 процессах:
-- `main.py` — Telegram polling, SQLite, маршрутизация событий и topic/message mapping
-- `max-sdk-worker` — все Max SDK операции `send_*`, `edit_message`, `get_message`, `get_chat_history`, `download_*`
-- `max-polling` — подписки на MAX чаты и чтение входящих `MaxEvent`
+The script asks for the SMS code and then writes the session file. After that the
+bot can run non-interactively through `python main.py` or Docker Compose.
 
-Причина такой схемы практическая: GOST/LibreSSL стек внутри MaxAPI может падать `SIGSEGV` в долгоживущем процессе при параллельных сетевых операциях. Вынос polling и SDK-call path в отдельные worker processes изолирует эти сбои от Telegram runtime.
+## Environment
 
-## Какие файлы относятся именно к bridge
+Required:
 
-- [main.py](main.py)
-- [max_bridge.py](max_bridge.py)
-- [database.py](database.py)
-- [rebuild_topics.py](rebuild_topics.py)
-- [config.py](config.py)
-- [init_max.py](init_max.py)
-- [complete_max_auth.py](complete_max_auth.py)
-- [check_chats.py](check_chats.py)
-- [scripts/start_bot.sh](scripts/start_bot.sh)
-- [scripts/stop_bot.sh](scripts/stop_bot.sh)
+- `TG_BOT_TOKEN`
+- `TG_GROUP_ID`
+- `MAX_PHONE`
 
-## Локальные runtime-данные
+Optional:
 
-Не коммитятся:
+- `MAX_DEVICE_ID=max2tg-bridge`
+- `MAX_SESSION_DIR=pymax`
+- `MAX_SESSION_NAME=session.db`
+
+## Runtime architecture
+
+- `main.py` handles Telegram polling, SQLite mapping, topic creation, message
+  upserts, edits, deletes, and reactions.
+- `max_bridge.py` wraps `pymax.Client` and preserves the old `MaxBridge`
+  interface used by `main.py`.
+- `database.py` stores Telegram topic mappings and message mappings.
+
+## Local runtime data
+
+Do not commit:
+
 - `.env`
-- `data/auth_bundle.json`
+- `data/pymax/`
 - `data/bridge.db`
 - `data/user_names.json`
 - `logs/`
 - `vendor/`
 
-## Что делает bridge поверх MaxAPI
+## Current behavior
 
-- создаёт Telegram topic на каждый чат MAX
-- хранит `chat_mapping`
-- хранит `message_mapping`
-- подавляет эхо `TG -> Max -> TG`
-- резолвит названия dialog-топиков из `login_payload["contacts"]` и `participants`, а не из `Чат <id>`
-- делает controlled replay истории при создании новых topics
-- умеет пересобрать topics через [rebuild_topics.py](rebuild_topics.py)
-- пробрасывает edit/delete/file workflows между системами
+- Creates one Telegram forum topic per MAX chat/dialog/channel.
+- Mirrors MAX -> Telegram messages, media, edits, deletes, and reactions where
+  the underlying `pymax` event/API exposes the data.
+- Mirrors Telegram topic messages back to the mapped MAX chat.
+- Suppresses echo messages from Telegram -> MAX -> Telegram using message IDs.
+- Replays recent history when a new Telegram topic is created.
 
-## Известные edge cases
+## Known limits
 
-- MAX-сообщения со служебными attach (`INLINE_KEYBOARD`, `CONTROL`) нельзя учитывать как отдельное медиа при upsert в Telegram. Для idempotent update bridge должен редактировать caption у одного `PHOTO/VIDEO/FILE`, а не делать delete+resend из-за второго служебного attach.
-- Повторные `opcode=128` для одного `max_message_id` возможны. Защита от дублей держится на `message_mapping` и idempotent update, а не на предположении “event всегда придёт один раз”.
-
-## Ограничения
-
-- реакции пока не включены
-- удаление поддержано только `Max -> TG`
-- большие Telegram-видео по-прежнему упираются в лимит Bot API на скачивание файла
+- History pagination is adapted to `pymax` history API and may need tuning after
+  live testing on real chats.
+- Media download URL availability depends on what MAX returns for each
+  attachment type.
+- Large Telegram videos are still limited by Telegram Bot API download limits.

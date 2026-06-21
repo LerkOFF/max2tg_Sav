@@ -12,4 +12,4 @@ COPY . /app
 
 RUN mkdir -p /app/data /app/logs
 
-CMD ["python", "-u", "main.py"]
+ENTRYPOINT ["python", "-u", "docker_entrypoint.py"]

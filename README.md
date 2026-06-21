@@ -24,28 +24,48 @@ MAX_SESSION_DIR=pymax
 MAX_SESSION_NAME=session.db
 ```
 
-Authorize MAX once from an interactive terminal:
-
-```bash
-python init_max.py
-```
-
-The script asks for the SMS code and stores the session in
-`data/pymax/session.db`.
-
 Run locally:
 
 ```bash
 python main.py
 ```
 
-## Docker
-
-Build and run:
+On first local run, if `data/pymax/session.db` is missing, authorize MAX with:
 
 ```bash
-docker compose build
-docker compose up -d
+python init_max.py
+```
+
+## Docker
+
+One-time setup:
+
+```bash
+cp .env.example .env
+```
+
+Fill in `.env`, then start everything with one command:
+
+```bash
+docker compose up --build
+```
+
+On the first start the container will:
+
+1. validate `.env`
+2. request MAX SMS authorization if `data/pymax/session.db` is missing
+3. start the bridge automatically after auth
+
+Ways to enter the SMS code on first start:
+
+- enter it in the terminal when running `docker compose up`
+- write the code to `data/.max_sms_code` while the container is waiting
+- set `MAX_SMS_CODE=123456` in `.env` and restart the container
+
+After the first successful auth, the same command also works in the background:
+
+```bash
+docker compose up -d --build
 ```
 
 The compose file mounts:
@@ -53,9 +73,6 @@ The compose file mounts:
 - `.env` to `/app/.env`
 - `data/` to `/app/data`
 - `logs/` to `/app/logs`
-
-Authorize MAX before starting the container, or run `python init_max.py` inside
-an interactive container with the same mounted `data/` directory.
 
 ## Files
 

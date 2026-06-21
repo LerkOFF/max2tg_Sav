@@ -2,6 +2,8 @@ services:
   max2tg:
     build:
       context: .
+    stdin_open: true
+    tty: true
     dns:
       - 1.1.1.1
       - 8.8.8.8

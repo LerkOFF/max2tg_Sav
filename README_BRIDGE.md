@@ -71,10 +71,8 @@ Do not commit:
 
 ## Known limits
 
-- TG -> MAX voice uses `FILE_UPLOAD` (opcode 87), then `MSG_TYPING` / `UPLOAD_ATTACH_PREP`
-  (opcode 65) with type `AUDIO` or `FILE`, multipart HTTP upload, and `NOTIF_ATTACH` wait.
-  Native `AUDIO` attach (`audioId`/`token`, `duration`, `wave`) is tried first; on
-  `Invalid attachment` the bridge falls back to a `FILE` attach.
+- TG -> MAX voice tries native `AUDIO` once (experimental). On `Invalid attachment`
+  or connection loss it falls back to `pymax` `File()` upload (`FILE` attach).
 - History pagination is adapted to `pymax` history API and may need tuning after
   live testing on real chats.
 - Media download URL availability depends on what MAX returns for each

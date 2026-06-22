@@ -19,9 +19,9 @@ import aiohttp
 from config import DATA_DIR, MAX_DEVICE_ID, MAX_PHONE, MAX_SESSION_DIR, MAX_SESSION_NAME
 from max_audio import (
     build_audio_attach_payload,
-    build_file_attach_payload,
     duration_seconds_to_ms,
     is_attachment_not_ready_error,
+    is_connection_error,
     is_invalid_attachment_error,
     telegram_waveform_to_max_wave,
     voice_mime_type,
@@ -407,7 +407,6 @@ class MaxBridge:
         return await self._send_local_attachment("file", **kwargs)
 
     async def send_local_audio(self, **kwargs):
-        client = await self._get_client()
         path = kwargs.get("path") or kwargs.get("file_path") or kwargs.get("input_path")
         if not path:
             raise ValueError("path is required")
@@ -425,75 +424,81 @@ class MaxBridge:
             else:
                 wave = telegram_waveform_to_max_wave(None, duration_sec=duration_sec)
 
+        native_error: Exception | None = None
+        try:
+            native_message = await self._try_send_native_audio_voice(
+                chat_id=chat_id,
+                input_path=Path(path),
+                caption=caption,
+                reply_to=reply_to,
+                duration_sec=duration_sec,
+                wave=wave,
+            )
+            if native_message is not None:
+                return native_message
+        except Exception as exc:
+            native_error = exc
+            if not is_invalid_attachment_error(str(exc)) and not is_connection_error(str(exc)):
+                raise
+            logger.warning("TG->Max: Native AUDIO voice rejected by Max: %s", exc)
+
+        if native_error is not None and is_connection_error(str(native_error)):
+            await self._pause_for_reconnect()
+
+        logger.info(
+            "TG->Max: Sending voice as FILE attach via pymax chat_id=%s path=%s",
+            chat_id,
+            path,
+        )
+        return await self._send_local_attachment(
+            "file",
+            chat_id=chat_id,
+            input_path=path,
+            text=caption,
+            reply_to=reply_to,
+        )
+
+    async def _pause_for_reconnect(self, seconds: float = 2.5) -> None:
+        await asyncio.sleep(seconds)
+        try:
+            await self.wait_ready(timeout=30)
+        except TimeoutError:
+            logger.warning("TG->Max: Max client not ready after reconnect pause")
+
+    async def _try_send_native_audio_voice(
+        self,
+        *,
+        chat_id: int,
+        input_path: Path,
+        caption: str,
+        reply_to: int | None,
+        duration_sec: int,
+        wave: str,
+    ):
+        client = await self._get_client()
         duration_ms = duration_seconds_to_ms(duration_sec)
         upload_info = await self._upload_voice_file(
             client,
             chat_id=chat_id,
-            input_path=Path(path),
+            input_path=input_path,
             prep_type="AUDIO",
         )
-        audio_attaches = [
-            build_audio_attach_payload(
-                audio_id=upload_info["file_id"],
-                token=upload_info.get("token"),
-                duration_ms=duration_ms,
-                wave=wave,
-            ),
-            build_audio_attach_payload(
-                audio_id=None,
-                token=upload_info.get("token"),
-                duration_ms=duration_ms,
-                wave=wave,
-            ),
-        ]
-        for index, attach in enumerate(audio_attaches, start=1):
-            logger.info(
-                "TG->Max: Trying native voice attach variant %s chat_id=%s payload=%s",
-                index,
-                chat_id,
-                attach,
-            )
-            try:
-                message = await self._send_message_with_attach(
-                    client,
-                    chat_id=chat_id,
-                    text=caption,
-                    attach=attach,
-                    reply_to=reply_to,
-                )
-                return _message_to_dict(message) if message else None
-            except Exception as exc:
-                if is_invalid_attachment_error(str(exc)) and index < len(audio_attaches):
-                    logger.warning(
-                        "TG->Max: Native voice attach variant %s rejected by Max: %s",
-                        index,
-                        exc,
-                    )
-                    continue
-                if not is_invalid_attachment_error(str(exc)):
-                    raise
-
-        logger.warning(
-            "TG->Max: Native AUDIO attach rejected, falling back to FILE chat_id=%s",
-            chat_id,
+        attach = build_audio_attach_payload(
+            audio_id=upload_info["file_id"],
+            token=upload_info.get("token"),
+            duration_ms=duration_ms,
+            wave=wave,
         )
-        upload_info = await self._upload_voice_file(
-            client,
-            chat_id=chat_id,
-            input_path=Path(path),
-            prep_type="FILE",
-        )
-        file_attach = build_file_attach_payload(file_id=upload_info["file_id"])
         logger.info(
-            "TG->Max: Sending voice as FILE attach chat_id=%s payload=%s",
+            "TG->Max: Trying native AUDIO voice chat_id=%s payload=%s",
             chat_id,
-            file_attach,
+            attach,
         )
         message = await self._send_message_with_attach(
             client,
             chat_id=chat_id,
             text=caption,
-            attach=file_attach,
+            attach=attach,
             reply_to=reply_to,
         )
         return _message_to_dict(message) if message else None
@@ -644,6 +649,14 @@ class MaxBridge:
                 )
                 if is_attachment_not_ready_error(error_text) and attempt + 1 < max_attempts:
                     await asyncio.sleep(1 + attempt)
+                    continue
+                raise
+            except (ConnectionError, OSError) as exc:
+                last_error = exc
+                if attempt + 1 < max_attempts:
+                    await self._pause_for_reconnect()
+                    client = await self._get_client()
+                    app = client._app
                     continue
                 raise
         if last_error is not None:

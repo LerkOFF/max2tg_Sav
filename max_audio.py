@@ -105,3 +105,8 @@ def is_attachment_not_ready_error(error_text: str) -> bool:
 def is_invalid_attachment_error(error_text: str) -> bool:
     lowered = error_text.lower()
     return "invalid attachment" in lowered or "proto.payload" in lowered
+
+
+def is_connection_error(error_text: str) -> bool:
+    lowered = error_text.lower()
+    return "connection closed" in lowered or "connection lost" in lowered

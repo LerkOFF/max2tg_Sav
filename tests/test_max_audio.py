@@ -9,6 +9,7 @@ from max_audio import (
     build_file_attach_payload,
     duration_seconds_to_ms,
     is_attachment_not_ready_error,
+    is_connection_error,
     is_invalid_attachment_error,
     normalize_waveform_bytes,
     synthetic_waveform,
@@ -78,6 +79,10 @@ class TestMaxAudioHelpers(unittest.TestCase):
     def test_is_invalid_attachment_error(self) -> None:
         self.assertTrue(is_invalid_attachment_error("Invalid attachment"))
         self.assertFalse(is_invalid_attachment_error("errors.process.attachment.not.ready"))
+
+    def test_is_connection_error(self) -> None:
+        self.assertTrue(is_connection_error("Connection closed by the server"))
+        self.assertFalse(is_connection_error("Invalid attachment"))
 
 
 if __name__ == "__main__":

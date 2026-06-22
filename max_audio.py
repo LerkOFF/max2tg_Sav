@@ -72,16 +72,17 @@ def telegram_waveform_to_max_wave(
 
 def build_audio_attach_payload(
     *,
-    audio_id: int,
+    audio_id: int | None,
     token: str | None,
     duration_ms: int,
     wave: str | None = None,
 ) -> dict:
     attach: dict = {
         "_type": "AUDIO",
-        "audioId": int(audio_id),
-        "duration": int(duration_ms),
+        "duration": max(int(duration_ms), 1),
     }
+    if audio_id is not None:
+        attach["audioId"] = int(audio_id)
     if token:
         attach["token"] = token
     if wave:
@@ -89,6 +90,18 @@ def build_audio_attach_payload(
     return attach
 
 
+def build_file_attach_payload(*, file_id: int) -> dict:
+    return {
+        "_type": "FILE",
+        "fileId": int(file_id),
+    }
+
+
 def is_attachment_not_ready_error(error_text: str) -> bool:
     lowered = error_text.lower()
     return "not.ready" in lowered or "not.processed" in lowered
+
+
+def is_invalid_attachment_error(error_text: str) -> bool:
+    lowered = error_text.lower()
+    return "invalid attachment" in lowered or "proto.payload" in lowered

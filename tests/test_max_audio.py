@@ -6,8 +6,10 @@ import unittest
 from max_audio import (
     MAX_WAVE_SAMPLES,
     build_audio_attach_payload,
+    build_file_attach_payload,
     duration_seconds_to_ms,
     is_attachment_not_ready_error,
+    is_invalid_attachment_error,
     normalize_waveform_bytes,
     synthetic_waveform,
     telegram_waveform_to_max_wave,
@@ -63,10 +65,19 @@ class TestMaxAudioHelpers(unittest.TestCase):
         self.assertEqual(payload["duration"], 5000)
         self.assertEqual(payload["wave"], "wave-b64")
 
+    def test_build_file_attach_payload(self) -> None:
+        payload = build_file_attach_payload(file_id=99)
+        self.assertEqual(payload["_type"], "FILE")
+        self.assertEqual(payload["fileId"], 99)
+
     def test_is_attachment_not_ready_error(self) -> None:
         self.assertTrue(is_attachment_not_ready_error("errors.process.attachment.not.ready"))
         self.assertTrue(is_attachment_not_ready_error("errors.process.attachment.video.not.processed"))
         self.assertFalse(is_attachment_not_ready_error("errors.unknown"))
+
+    def test_is_invalid_attachment_error(self) -> None:
+        self.assertTrue(is_invalid_attachment_error("Invalid attachment"))
+        self.assertFalse(is_invalid_attachment_error("errors.process.attachment.not.ready"))
 
 
 if __name__ == "__main__":

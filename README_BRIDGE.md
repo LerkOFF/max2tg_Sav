@@ -71,8 +71,9 @@ Do not commit:
 
 ## Known limits
 
-- TG -> MAX voice tries native `AUDIO` once (experimental). On `Invalid attachment`
-  or connection loss it falls back to `pymax` `File()` upload (`FILE` attach).
+- TG -> MAX voice uploads once with `FILE` prep and sends a `FILE` attach (`.oga`).
+  Experimental native `AUDIO` bubble is off by default; set `MAX_TRY_NATIVE_AUDIO_VOICE=1`
+  to test it (may disconnect the Max session on rejection).
 - History pagination is adapted to `pymax` history API and may need tuning after
   live testing on real chats.
 - Media download URL availability depends on what MAX returns for each

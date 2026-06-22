@@ -16,9 +16,17 @@ from urllib.request import Request, urlopen
 
 import aiohttp
 
-from config import DATA_DIR, MAX_DEVICE_ID, MAX_PHONE, MAX_SESSION_DIR, MAX_SESSION_NAME
+from config import (
+    DATA_DIR,
+    MAX_DEVICE_ID,
+    MAX_PHONE,
+    MAX_SESSION_DIR,
+    MAX_SESSION_NAME,
+    MAX_TRY_NATIVE_AUDIO_VOICE,
+)
 from max_audio import (
     build_audio_attach_payload,
+    build_file_attach_payload,
     duration_seconds_to_ms,
     is_attachment_not_ready_error,
     is_connection_error,
@@ -424,39 +432,87 @@ class MaxBridge:
             else:
                 wave = telegram_waveform_to_max_wave(None, duration_sec=duration_sec)
 
-        native_error: Exception | None = None
-        try:
-            native_message = await self._try_send_native_audio_voice(
-                chat_id=chat_id,
-                input_path=Path(path),
-                caption=caption,
-                reply_to=reply_to,
-                duration_sec=duration_sec,
-                wave=wave,
-            )
-            if native_message is not None:
-                return native_message
-        except Exception as exc:
-            native_error = exc
-            if not is_invalid_attachment_error(str(exc)) and not is_connection_error(str(exc)):
-                raise
-            logger.warning("TG->Max: Native AUDIO voice rejected by Max: %s", exc)
+        if MAX_TRY_NATIVE_AUDIO_VOICE:
+            try:
+                native_message = await self._try_send_native_audio_voice(
+                    chat_id=chat_id,
+                    input_path=Path(path),
+                    caption=caption,
+                    reply_to=reply_to,
+                    duration_sec=duration_sec,
+                    wave=wave,
+                )
+                if native_message is not None:
+                    return native_message
+            except Exception as exc:
+                if not is_invalid_attachment_error(str(exc)) and not is_connection_error(str(exc)):
+                    raise
+                logger.warning("TG->Max: Native AUDIO voice rejected by Max: %s", exc)
+            await self._pause_for_reconnect(seconds=3.0)
 
-        if native_error is not None and is_connection_error(str(native_error)):
-            await self._pause_for_reconnect()
-
-        logger.info(
-            "TG->Max: Sending voice as FILE attach via pymax chat_id=%s path=%s",
-            chat_id,
-            path,
-        )
-        return await self._send_local_attachment(
-            "file",
+        upload_info = await self._upload_voice_file_with_retry(
             chat_id=chat_id,
-            input_path=path,
-            text=caption,
-            reply_to=reply_to,
+            input_path=Path(path),
+            prep_type="FILE",
         )
+        return await self._send_voice_file_attach(
+            chat_id=chat_id,
+            caption=caption,
+            reply_to=reply_to,
+            file_id=int(upload_info["file_id"]),
+        )
+
+    async def _send_voice_file_attach(
+        self,
+        *,
+        chat_id: int,
+        caption: str,
+        reply_to: int | None,
+        file_id: int,
+        max_attempts: int = 4,
+    ):
+        attach = build_file_attach_payload(file_id=file_id)
+        last_error: Exception | None = None
+        for attempt in range(max_attempts):
+            try:
+                client = await self._get_client()
+                logger.info(
+                    "TG->Max: Sending voice as FILE attach chat_id=%s file_id=%s attempt=%s payload=%s",
+                    chat_id,
+                    file_id,
+                    attempt + 1,
+                    attach,
+                )
+                message = await self._send_message_with_attach(
+                    client,
+                    chat_id=chat_id,
+                    text=caption,
+                    attach=attach,
+                    reply_to=reply_to,
+                )
+                return _message_to_dict(message) if message else None
+            except Exception as exc:
+                last_error = exc
+                error_text = str(exc)
+                if attempt + 1 >= max_attempts:
+                    raise
+                if (
+                    is_connection_error(error_text)
+                    or is_attachment_not_ready_error(error_text)
+                    or "upload" in error_text.lower()
+                ):
+                    logger.warning(
+                        "TG->Max: FILE voice send failed chat_id=%s attempt=%s: %s",
+                        chat_id,
+                        attempt + 1,
+                        exc,
+                    )
+                    await self._pause_for_reconnect(seconds=2.5 + attempt)
+                    continue
+                raise
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("Failed to send voice FILE attachment to Max")
 
     async def _pause_for_reconnect(self, seconds: float = 2.5) -> None:
         await asyncio.sleep(seconds)
@@ -477,8 +533,7 @@ class MaxBridge:
     ):
         client = await self._get_client()
         duration_ms = duration_seconds_to_ms(duration_sec)
-        upload_info = await self._upload_voice_file(
-            client,
+        upload_info = await self._upload_voice_file_with_retry(
             chat_id=chat_id,
             input_path=input_path,
             prep_type="AUDIO",
@@ -502,6 +557,44 @@ class MaxBridge:
             reply_to=reply_to,
         )
         return _message_to_dict(message) if message else None
+
+    async def _upload_voice_file_with_retry(
+        self,
+        *,
+        chat_id: int,
+        input_path: Path,
+        prep_type: str,
+        max_attempts: int = 4,
+    ) -> dict[str, Any]:
+        last_error: Exception | None = None
+        for attempt in range(max_attempts):
+            try:
+                active_client = await self._get_client()
+                return await self._upload_voice_file(
+                    active_client,
+                    chat_id=chat_id,
+                    input_path=input_path,
+                    prep_type=prep_type,
+                )
+            except Exception as exc:
+                last_error = exc
+                error_text = str(exc)
+                if attempt + 1 >= max_attempts:
+                    raise
+                if is_connection_error(error_text) or "upload" in error_text.lower():
+                    logger.warning(
+                        "TG->Max: Voice upload failed chat_id=%s prep_type=%s attempt=%s: %s",
+                        chat_id,
+                        prep_type,
+                        attempt + 1,
+                        exc,
+                    )
+                    await self._pause_for_reconnect(seconds=2.5 + attempt)
+                    continue
+                raise
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("Failed to upload voice file to Max")
 
     async def _upload_voice_file(
         self,

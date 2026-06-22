@@ -28,3 +28,8 @@ MAX_SESSION_DIR = DATA_DIR / os.getenv("MAX_SESSION_DIR", "pymax")
 MAX_SESSION_NAME = os.getenv("MAX_SESSION_NAME", "session.db")
 TG_POLLING_TIMEOUT = int(os.getenv("TG_POLLING_TIMEOUT", "30"))
 CHAT_RECONCILE_INTERVAL_SECONDS = int(os.getenv("CHAT_RECONCILE_INTERVAL_SECONDS", "300"))
+MAX_TRY_NATIVE_AUDIO_VOICE = os.getenv("MAX_TRY_NATIVE_AUDIO_VOICE", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+}

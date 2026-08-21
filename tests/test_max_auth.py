@@ -120,6 +120,7 @@ class TestMaxAuth(unittest.TestCase):
         from max_auth import extract_sms_code
 
         self.assertEqual(extract_sms_code("504310"), "504310")
+        self.assertEqual(extract_sms_code(" 504 310 "), "504310")
         self.assertIsNone(extract_sms_code("код 504310"))
         self.assertIsNone(extract_sms_code(""))
         self.assertIsNone(extract_sms_code(None))

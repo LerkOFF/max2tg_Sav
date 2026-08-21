@@ -13,11 +13,12 @@ SMS_CODE_FILE = Path(os.getenv("MAX_SMS_CODE_FILE", "data/.max_sms_code"))
 SMS_CODE_POLL_SECONDS = float(os.getenv("MAX_SMS_CODE_POLL_SECONDS", "3"))
 SMS_CODE_RE = re.compile(r"^\d{4,8}$")
 
-SmsRequestNotifier = Callable[[str], Awaitable[None]]
+SmsRequestNotifier = Callable[[str, str], Awaitable[None]]
 
 _sms_request_notifier: SmsRequestNotifier | None = None
 _sms_code_queue: asyncio.Queue[str] | None = None
 _waiting_for_sms = False
+_sms_retry = False
 
 
 def set_sms_request_notifier(notifier: SmsRequestNotifier | None) -> None:
@@ -32,7 +33,7 @@ def is_waiting_for_sms_code() -> bool:
 def extract_sms_code(text: str | None) -> str | None:
     if not text:
         return None
-    code = text.strip()
+    code = re.sub(r"\s+", "", text.strip())
     if SMS_CODE_RE.fullmatch(code):
         return code
     return None
@@ -79,7 +80,7 @@ class WaitingSmsCodeProvider:
         self._file_mtime_at_start = _sms_code_file_mtime()
 
     async def get_code(self, phone: str) -> str:
-        global _sms_code_queue, _waiting_for_sms
+        global _sms_code_queue, _waiting_for_sms, _sms_retry
 
         SMS_CODE_FILE.parent.mkdir(parents=True, exist_ok=True)
         if os.getenv("MAX_SMS_CODE", "").strip():
@@ -99,10 +100,17 @@ class WaitingSmsCodeProvider:
         _sms_code_queue = asyncio.Queue()
         _waiting_for_sms = True
         if _sms_request_notifier is not None:
-            await _sms_request_notifier(phone)
+            kind = "expired" if _sms_retry else "requested"
+            await _sms_request_notifier(kind, phone)
+        _sms_retry = False
 
         stdin_task: asyncio.Task[str] | None = None
-        if sys.stdin.isatty():
+        use_stdin = sys.stdin.isatty() and os.getenv("MAX_SMS_USE_STDIN", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+        if use_stdin:
             stdin_task = asyncio.create_task(
                 asyncio.to_thread(input, f"Enter SMS code for {phone}: ")
             )
@@ -290,6 +298,8 @@ async def authorize_max() -> None:
 
 
 async def ensure_max_session() -> None:
+    global _sms_retry
+
     if is_max_authorized():
         print(f"MAX session found: {max_session_path()}", flush=True)
         return
@@ -313,19 +323,22 @@ async def ensure_max_session() -> None:
             if not _is_wrong_sms_code_error(exc):
                 raise
             print(
-                "Wrong SMS code. Waiting for a new SMS and a fresh code in "
-                f"{SMS_CODE_FILE}.",
+                "SMS code rejected by MAX; requesting a new one after the submitted code.",
                 flush=True,
             )
+            _sms_retry = True
             _prepare_for_sms_auth()
             continue
         except Exception:
             if is_max_authorized():
-                return
+                break
             raise
 
         if is_max_authorized():
-            return
+            break
+
+    if _sms_request_notifier is not None:
+        await _sms_request_notifier("success", MAX_PHONE)
 
 
 async def main() -> None:

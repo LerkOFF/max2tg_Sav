@@ -10,6 +10,7 @@ import aiosqlite
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError, TelegramRetryAfter
+from aiogram.filters import Filter
 from aiogram.types import Message, FSInputFile, ReactionTypeEmoji
 from config import (
     CHAT_RECONCILE_INTERVAL_SECONDS,
@@ -137,18 +138,34 @@ async def send_general_message(text: str) -> None:
             TG_GROUP_ID,
             text,
             message_thread_id=GENERAL_TOPIC_ID,
+            allow_sending_without_reply=True,
         )
-    except TelegramBadRequest:
-        logger.warning("Failed to send to General topic %s, falling back to chat root", GENERAL_TOPIC_ID)
+    except TelegramBadRequest as exc:
+        logger.warning(
+            "Failed to send to General topic %s (%s), falling back to chat root",
+            GENERAL_TOPIC_ID,
+            exc,
+        )
         await bot.send_message(TG_GROUP_ID, text)
 
 
-async def notify_sms_requested(phone: str) -> None:
-    await send_general_message(
-        "Сессия MAX истекла или нужна авторизация.\n"
-        f"На номер {_mask_phone(phone)} отправлен SMS-код.\n"
-        "Пришлите код сюда, в General (/1)."
-    )
+async def notify_sms_requested(kind: str, phone: str) -> None:
+    if kind == "requested":
+        await send_general_message(
+            "Сессия MAX истекла или нужна авторизация.\n"
+            f"На номер {_mask_phone(phone)} отправлен SMS-код.\n"
+            "Пришлите код сюда, в General (/1)."
+        )
+        return
+    if kind == "expired":
+        await send_general_message(
+            "Код не подошёл: истёк или неверный.\n"
+            f"На номер {_mask_phone(phone)} отправлен новый SMS.\n"
+            "Пришлите свежий код сюда."
+        )
+        return
+    if kind == "success":
+        await send_general_message("Сессия MAX восстановлена.")
 
 
 def _pid_is_running(pid: int) -> bool:
@@ -2093,16 +2110,35 @@ def _extract_tg_edit_text(message: Message) -> str | None:
         return message.caption
     return None
 
-@dp.message(F.chat.id == TG_GROUP_ID, F.message_thread_id == GENERAL_TOPIC_ID)
+class PendingSmsCodeFilter(Filter):
+    async def __call__(self, message: Message) -> bool:
+        if message.chat.id != TG_GROUP_ID:
+            return False
+        if message.from_user and message.from_user.is_bot:
+            return False
+        if not is_waiting_for_sms_code():
+            return False
+        if message.message_thread_id not in (None, GENERAL_TOPIC_ID):
+            return False
+        return extract_sms_code(message.text) is not None
+
+
+@dp.message(PendingSmsCodeFilter())
 async def ingest_general_sms_code(m: Message):
-    if m.from_user and m.from_user.is_bot:
-        return
-    if not is_waiting_for_sms_code():
-        return
     code = extract_sms_code(m.text)
     if not code:
         return
-    if submit_sms_code(code):
+    logger.info(
+        "SMS code received from Telegram thread=%s user=%s",
+        m.message_thread_id,
+        m.from_user.id if m.from_user else None,
+    )
+    if not submit_sms_code(code):
+        logger.warning("SMS code received but auth waiter is gone")
+        return
+    try:
+        await m.answer("Код принят, логинюсь в MAX...")
+    except TelegramBadRequest:
         await send_general_message("Код принят, логинюсь в MAX...")
 
 

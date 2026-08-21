@@ -2,20 +2,73 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import sys
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from config import MAX_DEVICE_ID, MAX_PHONE, MAX_SESSION_DIR, MAX_SESSION_NAME
 
 SMS_CODE_FILE = Path(os.getenv("MAX_SMS_CODE_FILE", "data/.max_sms_code"))
 SMS_CODE_POLL_SECONDS = float(os.getenv("MAX_SMS_CODE_POLL_SECONDS", "3"))
+SMS_CODE_RE = re.compile(r"^\d{4,8}$")
+
+SmsRequestNotifier = Callable[[str], Awaitable[None]]
+
+_sms_request_notifier: SmsRequestNotifier | None = None
+_sms_code_queue: asyncio.Queue[str] | None = None
+_waiting_for_sms = False
+
+
+def set_sms_request_notifier(notifier: SmsRequestNotifier | None) -> None:
+    global _sms_request_notifier
+    _sms_request_notifier = notifier
+
+
+def is_waiting_for_sms_code() -> bool:
+    return _waiting_for_sms
+
+
+def extract_sms_code(text: str | None) -> str | None:
+    if not text:
+        return None
+    code = text.strip()
+    if SMS_CODE_RE.fullmatch(code):
+        return code
+    return None
+
+
+def submit_sms_code(code: str) -> bool:
+    if _sms_code_queue is None:
+        return False
+    cleaned = (code or "").strip()
+    if not cleaned:
+        return False
+    _sms_code_queue.put_nowait(cleaned)
+    return True
+
+
+def _exc_blob(exc: BaseException) -> str:
+    error_code = getattr(exc, "error", None)
+    return f"{error_code or ''} {exc}".lower()
 
 
 def _is_wrong_sms_code_error(exc: BaseException) -> bool:
-    error_code = getattr(exc, "error", None)
-    if error_code == "verify.code.wrong":
-        return True
-    return "verify.code.wrong" in str(exc)
+    blob = _exc_blob(exc)
+    return "verify.code.wrong" in blob or "error.code.attempt.limit" in blob or "код устарел" in blob
+
+
+def is_stale_session_error(exc: BaseException) -> bool:
+    blob = _exc_blob(exc)
+    return any(
+        token in blob
+        for token in (
+            "login.token",
+            "fail_login_token",
+            "not connected to the server",
+            "transport is not connected",
+        )
+    )
 
 
 class WaitingSmsCodeProvider:
@@ -26,6 +79,8 @@ class WaitingSmsCodeProvider:
         self._file_mtime_at_start = _sms_code_file_mtime()
 
     async def get_code(self, phone: str) -> str:
+        global _sms_code_queue, _waiting_for_sms
+
         SMS_CODE_FILE.parent.mkdir(parents=True, exist_ok=True)
         if os.getenv("MAX_SMS_CODE", "").strip():
             print(
@@ -36,11 +91,15 @@ class WaitingSmsCodeProvider:
             )
         print(
             f"SMS code requested for {phone}.\n"
-            f"Write the fresh code to {SMS_CODE_FILE}:\n"
-            f"  echo 123456 > {SMS_CODE_FILE}\n"
-            "Or enter the code in this terminal if input is available.",
+            f"Send it in Telegram General topic /1, or write it to {SMS_CODE_FILE}:\n"
+            f"  echo 123456 > {SMS_CODE_FILE}",
             flush=True,
         )
+
+        _sms_code_queue = asyncio.Queue()
+        _waiting_for_sms = True
+        if _sms_request_notifier is not None:
+            await _sms_request_notifier(phone)
 
         stdin_task: asyncio.Task[str] | None = None
         if sys.stdin.isatty():
@@ -60,6 +119,17 @@ class WaitingSmsCodeProvider:
                         _clear_sms_code_file()
                     return code
 
+                try:
+                    queued = await asyncio.wait_for(
+                        _sms_code_queue.get(),
+                        timeout=SMS_CODE_POLL_SECONDS,
+                    )
+                except TimeoutError:
+                    queued = None
+                if queued:
+                    print("Using SMS code from Telegram General topic", flush=True)
+                    return queued
+
                 if stdin_task is not None:
                     if stdin_task.done():
                         try:
@@ -77,11 +147,12 @@ class WaitingSmsCodeProvider:
 
                 print(
                     f"Waiting for SMS code for {phone}... "
-                    f"(write it to {SMS_CODE_FILE})",
+                    f"(Telegram General /1 or {SMS_CODE_FILE})",
                     flush=True,
                 )
-                await asyncio.sleep(SMS_CODE_POLL_SECONDS)
         finally:
+            _waiting_for_sms = False
+            _sms_code_queue = None
             if stdin_task is not None and not stdin_task.done():
                 stdin_task.cancel()
 

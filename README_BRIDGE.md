@@ -17,6 +17,9 @@ Run initial authorization from an interactive terminal:
 python init_max.py
 ```
 
+If the session expires later, the running bot asks for a fresh SMS code in
+Telegram General topic `/1`. You can still pass a code via `data/.max_sms_code`.
+
 The script asks for the SMS code and then writes the session file. After that the
 bot can run non-interactively through `python main.py` or Docker Compose.
 
@@ -33,6 +36,8 @@ Optional:
 - `MAX_DEVICE_ID=max2tg-bridge`
 - `MAX_SESSION_DIR=pymax`
 - `MAX_SESSION_NAME=session.db`
+- `GENERAL_TOPIC_ID=1` — Telegram forum General topic for SMS re-auth
+- `SESSION_CHECK_INTERVAL_SECONDS=86400` — daily MAX session probe
 - `STARTUP_BACKFILL_ENABLED=true` — backfill recent history on startup
 - `STARTUP_BACKFILL_CHATS_LIMIT=10` — only the N most recent MAX dialogs
 - `STARTUP_BACKFILL_MESSAGES_PER_CHAT=10` — messages per dialog on startup

@@ -37,10 +37,8 @@ def prepare_runtime_dirs() -> None:
 async def bootstrap() -> None:
     validate_bridge_config()
     prepare_runtime_dirs()
-
-    from max_auth import ensure_max_session
-
-    await ensure_max_session()
+    # MAX login happens in main.py so Telegram can collect the SMS code
+    # in General topic /1 if the session is missing or expired.
 
 
 def start_bridge() -> None:

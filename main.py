@@ -11,9 +11,23 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError, TelegramRetryAfter
 from aiogram.types import Message, FSInputFile, ReactionTypeEmoji
-from config import CHAT_RECONCILE_INTERVAL_SECONDS, TG_BOT_TOKEN, TG_GROUP_ID, TG_POLLING_TIMEOUT
+from config import (
+    CHAT_RECONCILE_INTERVAL_SECONDS,
+    GENERAL_TOPIC_ID,
+    SESSION_CHECK_INTERVAL_SECONDS,
+    TG_BOT_TOKEN,
+    TG_GROUP_ID,
+    TG_POLLING_TIMEOUT,
+)
 from database import BridgeDB
 from max_audio import voice_temp_path
+from max_auth import (
+    extract_sms_code,
+    is_waiting_for_sms_code,
+    remove_stale_max_session,
+    set_sms_request_notifier,
+    submit_sms_code,
+)
 from max_bridge import (
     MaxBridge,
     MaxContactEvent,
@@ -81,6 +95,8 @@ bot = Bot(token=TG_BOT_TOKEN, session=build_telegram_session())
 dp = Dispatcher()
 db = BridgeDB()
 max_bridge = MaxBridge()
+_max_auth_lock = asyncio.Lock()
+_max_background_started = False
 _chat_topic_locks: dict[int, asyncio.Lock] = {}
 PID_FILE = Path("data/bot.pid")
 _recent_bridge_message_ids: dict[int, float] = {}
@@ -98,6 +114,7 @@ STARTUP_BACKFILL_MESSAGES_PER_CHAT = int(os.getenv("STARTUP_BACKFILL_MESSAGES_PE
 MAX_STATE_SYNC_MESSAGES_PER_CHAT = int(os.getenv("MAX_STATE_SYNC_MESSAGES_PER_CHAT", "20"))
 MAX_STATE_SYNC_INTERVAL_SECONDS = int(os.getenv("MAX_STATE_SYNC_INTERVAL_SECONDS", "300"))
 MAX_STARTUP_RETRY_SECONDS = int(os.getenv("MAX_STARTUP_RETRY_SECONDS", "30"))
+MAX_READY_TIMEOUT_SECONDS = float(os.getenv("MAX_READY_TIMEOUT_SECONDS", "90"))
 TG_SEND_NETWORK_RETRY_ATTEMPTS = int(os.getenv("TG_SEND_NETWORK_RETRY_ATTEMPTS", "3"))
 TG_SEND_NETWORK_RETRY_DELAY_SECONDS = float(os.getenv("TG_SEND_NETWORK_RETRY_DELAY_SECONDS", "2.0"))
 TG_VIDEO_SEND_TIMEOUT_SECONDS = int(os.getenv("TG_VIDEO_SEND_TIMEOUT_SECONDS", "180"))
@@ -105,6 +122,33 @@ TG_REACTION_MIN_INTERVAL_SECONDS = float(os.getenv("TG_REACTION_MIN_INTERVAL_SEC
 TG_REACTION_UPDATE_TTL_SECONDS = float(os.getenv("TG_REACTION_UPDATE_TTL_SECONDS", "3600"))
 TG_VIEWED_REACTION = os.getenv("TG_VIEWED_REACTION", "👀")
 TG_FORUM_TOPIC_CREATE_DELAY_SECONDS = float(os.getenv("TG_FORUM_TOPIC_CREATE_DELAY_SECONDS", "1.0"))
+
+
+def _mask_phone(phone: str) -> str:
+    cleaned = (phone or "").strip()
+    if len(cleaned) < 4:
+        return cleaned or "(не задан)"
+    return f"***{cleaned[-4:]}"
+
+
+async def send_general_message(text: str) -> None:
+    try:
+        await bot.send_message(
+            TG_GROUP_ID,
+            text,
+            message_thread_id=GENERAL_TOPIC_ID,
+        )
+    except TelegramBadRequest:
+        logger.warning("Failed to send to General topic %s, falling back to chat root", GENERAL_TOPIC_ID)
+        await bot.send_message(TG_GROUP_ID, text)
+
+
+async def notify_sms_requested(phone: str) -> None:
+    await send_general_message(
+        "Сессия MAX истекла или нужна авторизация.\n"
+        f"На номер {_mask_phone(phone)} отправлен SMS-код.\n"
+        "Пришлите код сюда, в General (/1)."
+    )
 
 
 def _pid_is_running(pid: int) -> bool:
@@ -1950,21 +1994,79 @@ async def reconcile_chats_forever(interval_seconds: int = CHAT_RECONCILE_INTERVA
         await asyncio.sleep(interval_seconds)
 
 
+async def _ensure_max_background_tasks() -> None:
+    global _max_background_started
+    if _max_background_started:
+        return
+    _max_background_started = True
+    asyncio.create_task(reconcile_chats_forever())
+    asyncio.create_task(sync_recent_message_states_forever())
+    asyncio.create_task(backfill_startup_topics_async())
+    asyncio.create_task(watch_max_session_forever())
+
+
+async def connect_max_session() -> None:
+    from max_auth import ensure_max_session, is_max_session_usable
+
+    async with _max_auth_lock:
+        await max_bridge.stop()
+        if not is_max_session_usable():
+            logger.warning("MAX session missing; requesting SMS login")
+            await ensure_max_session()
+        polling_task = asyncio.create_task(max_bridge.start_polling())
+        try:
+            await max_bridge.wait_ready(timeout=MAX_READY_TIMEOUT_SECONDS)
+        except TimeoutError:
+            logger.error("MAX session did not become ready; treating as expired")
+            if polling_task.done() and not polling_task.cancelled():
+                exc = polling_task.exception()
+                if exc:
+                    logger.error("MAX polling failed: %s", exc)
+            await max_bridge.stop()
+            remove_stale_max_session()
+            await ensure_max_session()
+            polling_task = asyncio.create_task(max_bridge.start_polling())
+            await max_bridge.wait_ready(timeout=MAX_READY_TIMEOUT_SECONDS)
+        await sync(verbose=True)
+        chat_ids = await load_mapped_chat_ids()
+        logger.info("Prepared %s chats for Max subscription", len(chat_ids))
+        await _ensure_max_background_tasks()
+
+
+async def watch_max_session_forever(interval_seconds: int = SESSION_CHECK_INTERVAL_SECONDS):
+    while True:
+        await asyncio.sleep(interval_seconds)
+        try:
+            ok = await max_bridge.probe_session()
+        except Exception:
+            logger.exception("MAX session daily probe crashed")
+            ok = False
+        if ok:
+            logger.info("MAX session daily probe ok")
+            continue
+        logger.warning("MAX session daily probe failed; requesting a new SMS code")
+        try:
+            await send_general_message(
+                "Проверка сессии MAX не прошла. Запрашиваю новый SMS-код."
+            )
+            remove_stale_max_session()
+            await connect_max_session()
+            await send_general_message("Сессия MAX восстановлена.")
+        except Exception:
+            logger.exception("Failed to recover MAX session after daily probe")
+            await send_general_message(
+                "Не удалось восстановить сессию MAX. Пришлите свежий SMS-код в General (/1)."
+            )
+
+
 async def start_max_runtime_forever() -> None:
     while True:
-        if await asyncio.to_thread(max_bridge.load_sdk):
-            asyncio.create_task(max_bridge.start_polling())
-            await max_bridge.wait_ready()
-            await sync(verbose=True)
-            chat_ids = await load_mapped_chat_ids()
-            logger.info("Prepared %s chats for Max subscription", len(chat_ids))
-            asyncio.create_task(reconcile_chats_forever())
-            asyncio.create_task(sync_recent_message_states_forever())
-            asyncio.create_task(backfill_startup_topics_async())
+        try:
+            await connect_max_session()
             return
-
-        logger.warning("Max SDK startup failed; retrying in %ss", MAX_STARTUP_RETRY_SECONDS)
-        await asyncio.sleep(MAX_STARTUP_RETRY_SECONDS)
+        except Exception:
+            logger.exception("Max SDK startup failed; retrying in %ss", MAX_STARTUP_RETRY_SECONDS)
+            await asyncio.sleep(MAX_STARTUP_RETRY_SECONDS)
 
 
 async def _record_tg_to_max_mapping(
@@ -1990,6 +2092,19 @@ def _extract_tg_edit_text(message: Message) -> str | None:
     if message.caption is not None:
         return message.caption
     return None
+
+@dp.message(F.chat.id == TG_GROUP_ID, F.message_thread_id == GENERAL_TOPIC_ID)
+async def ingest_general_sms_code(m: Message):
+    if m.from_user and m.from_user.is_bot:
+        return
+    if not is_waiting_for_sms_code():
+        return
+    code = extract_sms_code(m.text)
+    if not code:
+        return
+    if submit_sms_code(code):
+        await send_general_message("Код принят, логинюсь в MAX...")
+
 
 @dp.message(F.chat.id == TG_GROUP_ID)
 async def tg_to_max(m: Message):
@@ -2225,11 +2340,18 @@ async def tg_edit_to_max(m: Message):
     except Exception as exc:
         logger.exception("TG->Max edit propagation failed for tg_message_id=%s: %s", m.message_id, exc)
 
+async def on_startup() -> None:
+    asyncio.create_task(start_max_runtime_forever())
+
+
+dp.startup.register(on_startup)
+
+
 async def main():
     await db.init()
     max_bridge.set_on_event(on_max_event)
-    await start_max_runtime_forever()
-    logger.info("MAX runtime ready, starting Telegram polling...")
+    set_sms_request_notifier(notify_sms_requested)
+    logger.info("Starting Telegram polling (MAX connects after TG is ready)...")
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(
         bot,

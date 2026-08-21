@@ -35,7 +35,7 @@ from max_audio import (
     voice_mime_type,
     voice_upload_name,
 )
-from max_auth import is_max_session_usable
+from max_auth import is_max_session_usable, is_stale_session_error
 
 
 logger = logging.getLogger(__name__)
@@ -238,7 +238,9 @@ class MaxBridge:
         if self._polling_started:
             return
         self._polling_started = True
+        self._ready.clear()
         client = self._make_client(reconnect=True)
+        self.client = client
 
         @client.on_start()
         async def _started(c):
@@ -286,7 +288,14 @@ class MaxBridge:
                 )
             )
 
-        await client.start()
+        try:
+            await client.start()
+        except Exception:
+            self._polling_started = False
+            if self.client is client:
+                self.client = None
+            self._ready.clear()
+            raise
 
     async def _dispatch(self, event: MaxEvent) -> None:
         if self.on_event is None:
@@ -307,6 +316,31 @@ class MaxBridge:
 
     async def wait_ready(self, timeout: float = 60) -> None:
         await asyncio.wait_for(self._ready.wait(), timeout=timeout)
+
+    async def stop(self) -> None:
+        client = self.client
+        self.client = None
+        self.login_payload = None
+        self._polling_started = False
+        self._ready.clear()
+        if client is None:
+            return
+        try:
+            await client.stop()
+        except Exception:
+            logger.warning("Failed to stop Max client", exc_info=True)
+
+    async def probe_session(self) -> bool:
+        if not self.is_authorized() or self.client is None or not self._ready.is_set():
+            return False
+        try:
+            await asyncio.wait_for(self.list_chats(), timeout=30)
+            return True
+        except Exception as exc:
+            logger.warning("MAX session probe failed: %s", exc)
+            if is_stale_session_error(exc):
+                return False
+            return "timeout" not in str(exc).lower()
 
     def get_login_chats(self) -> list[dict]:
         payload = self.login_payload if isinstance(self.login_payload, dict) else {}

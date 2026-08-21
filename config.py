@@ -28,6 +28,9 @@ MAX_SESSION_DIR = DATA_DIR / os.getenv("MAX_SESSION_DIR", "pymax")
 MAX_SESSION_NAME = os.getenv("MAX_SESSION_NAME", "session.db")
 TG_POLLING_TIMEOUT = int(os.getenv("TG_POLLING_TIMEOUT", "30"))
 CHAT_RECONCILE_INTERVAL_SECONDS = int(os.getenv("CHAT_RECONCILE_INTERVAL_SECONDS", "300"))
+# Telegram forum General topic is always thread 1.
+GENERAL_TOPIC_ID = int(os.getenv("GENERAL_TOPIC_ID", "1"))
+SESSION_CHECK_INTERVAL_SECONDS = int(os.getenv("SESSION_CHECK_INTERVAL_SECONDS", str(24 * 60 * 60)))
 MAX_TRY_NATIVE_AUDIO_VOICE = os.getenv("MAX_TRY_NATIVE_AUDIO_VOICE", "").strip().lower() in {
     "1",
     "true",

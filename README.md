@@ -53,20 +53,15 @@ docker compose up --build
 On the first start the container will:
 
 1. validate `.env`
-2. request MAX SMS authorization if `data/pymax/session.db` is missing
-3. start the bridge automatically after auth
+2. start Telegram polling
+3. connect to MAX; if the session is missing or expired, ask for an SMS code
+   in the group's General topic (`/1`)
 
-Ways to enter the SMS code on first start:
+Reply in General with only the digits, for example `123456`. The file
+`data/.max_sms_code` still works as a fallback.
 
-```bash
-docker compose up --build
-```
-
-When you see `SMS code requested for +7...` in the logs, wait for the SMS and run in another terminal:
-
-```bash
-echo 123456 > data/.max_sms_code
-```
+Daily, the bot probes the MAX session. If the token is dead, it requests a
+new SMS and again waits for the code in General `/1`.
 
 Important:
 

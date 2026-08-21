@@ -116,6 +116,25 @@ class TestMaxAuth(unittest.TestCase):
                 _prepare_for_sms_auth()
                 self.assertFalse(code_file.exists())
 
+    def test_extract_sms_code_only_digits(self) -> None:
+        from max_auth import extract_sms_code
+
+        self.assertEqual(extract_sms_code("504310"), "504310")
+        self.assertIsNone(extract_sms_code("код 504310"))
+        self.assertIsNone(extract_sms_code(""))
+        self.assertIsNone(extract_sms_code(None))
+
+    def test_stale_session_error_detects_login_token(self) -> None:
+        from max_auth import is_stale_session_error, submit_sms_code
+
+        class FakeApiError(Exception):
+            error = "login.token"
+
+        self.assertTrue(is_stale_session_error(FakeApiError("FAIL_LOGIN_TOKEN")))
+        self.assertTrue(is_stale_session_error(RuntimeError("Not connected to the server")))
+        self.assertFalse(is_stale_session_error(RuntimeError("flood wait")))
+        self.assertFalse(submit_sms_code("123456"))
+
 
 if __name__ == "__main__":
     unittest.main()

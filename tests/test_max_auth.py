@@ -11,7 +11,10 @@ from unittest.mock import patch
 from max_auth import (
     _prepare_for_sms_auth,
     _resolve_fresh_sms_code,
+    _seconds_until_next_sms_request,
+    SmsCodeTimeout,
     WaitingPasswordProvider,
+    WaitingSmsCodeProvider,
     is_max_session_usable,
     remove_stale_max_session,
     submit_password,
@@ -163,6 +166,35 @@ class TestPasswordAuth(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(notifications[-1], ("password_retry", ""))
             self.assertTrue(submit_password("corrected", 42))
             self.assertEqual(await retry, "corrected")
+
+
+class TestDailySmsRequest(unittest.IsolatedAsyncioTestCase):
+    async def test_unanswered_code_times_out_and_records_request(self) -> None:
+        notifications: list[str] = []
+
+        async def notify(kind: str, phone: str) -> None:
+            notifications.append(kind)
+
+        with tempfile.TemporaryDirectory() as tmpdir, patch(
+            "max_auth.SMS_CODE_FILE", Path(tmpdir) / "code"
+        ), patch("max_auth.SMS_REQUEST_MARKER_FILE", Path(tmpdir) / "requested_at"), patch(
+            "max_auth.SMS_CODE_RENEW_SECONDS", 0.01
+        ), patch("max_auth.SMS_CODE_POLL_SECONDS", 0.005), patch(
+            "max_auth._sms_request_notifier", notify
+        ), patch("max_auth._sms_retry", False), patch("max_auth._sms_unanswered", False):
+            with self.assertRaises(SmsCodeTimeout):
+                await WaitingSmsCodeProvider().get_code("+79990000000")
+            self.assertEqual(notifications, ["requested"])
+            self.assertTrue((Path(tmpdir) / "requested_at").exists())
+
+    def test_restart_waits_until_next_daily_request(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            marker = Path(tmpdir) / "requested_at"
+            marker.write_text("1000", encoding="utf-8")
+            with patch("max_auth.SMS_REQUEST_MARKER_FILE", marker), patch(
+                "max_auth.time.time", return_value=1001
+            ):
+                self.assertEqual(_seconds_until_next_sms_request(), 86399)
 
 
 if __name__ == "__main__":

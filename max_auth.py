@@ -4,6 +4,7 @@ import asyncio
 import os
 import re
 import sys
+import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
@@ -11,6 +12,8 @@ from config import MAX_DEVICE_ID, MAX_PHONE, MAX_SESSION_DIR, MAX_SESSION_NAME
 
 SMS_CODE_FILE = Path(os.getenv("MAX_SMS_CODE_FILE", "data/.max_sms_code"))
 SMS_CODE_POLL_SECONDS = float(os.getenv("MAX_SMS_CODE_POLL_SECONDS", "3"))
+SMS_REQUEST_MARKER_FILE = Path("data/.max_sms_requested_at")
+SMS_CODE_RENEW_SECONDS = 24 * 60 * 60
 SMS_CODE_RE = re.compile(r"^\d{4,8}$")
 
 SmsRequestNotifier = Callable[[str, str], Awaitable[None]]
@@ -19,6 +22,7 @@ _sms_request_notifier: SmsRequestNotifier | None = None
 _sms_code_queue: asyncio.Queue[str] | None = None
 _waiting_for_sms = False
 _sms_retry = False
+_sms_unanswered = False
 _password_queue: asyncio.Queue[str] | None = None
 _waiting_for_password = False
 _password_user_id: int | None = None
@@ -84,6 +88,34 @@ def _is_wrong_sms_code_error(exc: BaseException) -> bool:
     return "verify.code.wrong" in blob or "error.code.attempt.limit" in blob or "код устарел" in blob
 
 
+class SmsCodeTimeout(TimeoutError):
+    """No code arrived before the next daily SMS request."""
+
+
+def _record_sms_request() -> None:
+    SMS_REQUEST_MARKER_FILE.parent.mkdir(parents=True, exist_ok=True)
+    SMS_REQUEST_MARKER_FILE.write_text(str(time.time()), encoding="utf-8")
+
+
+def _seconds_until_next_sms_request() -> float:
+    try:
+        requested_at = float(SMS_REQUEST_MARKER_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return 0.0
+    return max(0.0, requested_at + SMS_CODE_RENEW_SECONDS - time.time())
+
+
+def _clear_sms_request_marker() -> None:
+    SMS_REQUEST_MARKER_FILE.unlink(missing_ok=True)
+
+
+async def _wait_for_sms_request_window() -> None:
+    remaining = _seconds_until_next_sms_request()
+    if remaining > 0:
+        print(f"Next SMS request in {remaining / 3600:.1f} hours", flush=True)
+        await asyncio.sleep(remaining)
+
+
 def is_stale_session_error(exc: BaseException) -> bool:
     blob = _exc_blob(exc)
     return any(
@@ -105,9 +137,10 @@ class WaitingSmsCodeProvider:
         self._file_mtime_at_start = _sms_code_file_mtime()
 
     async def get_code(self, phone: str) -> str:
-        global _sms_code_queue, _waiting_for_sms, _sms_retry
+        global _sms_code_queue, _waiting_for_sms, _sms_retry, _sms_unanswered
 
         SMS_CODE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _record_sms_request()
         if os.getenv("MAX_SMS_CODE", "").strip():
             print(
                 "Warning: MAX_SMS_CODE is set in .env but is ignored during auth. "
@@ -125,9 +158,11 @@ class WaitingSmsCodeProvider:
         _sms_code_queue = asyncio.Queue()
         _waiting_for_sms = True
         if _sms_request_notifier is not None:
-            kind = "expired" if _sms_retry else "requested"
+            kind = "expired" if _sms_retry else "unanswered" if _sms_unanswered else "requested"
             await _sms_request_notifier(kind, phone)
         _sms_retry = False
+        _sms_unanswered = False
+        deadline = asyncio.get_running_loop().time() + SMS_CODE_RENEW_SECONDS
 
         stdin_task: asyncio.Task[str] | None = None
         use_stdin = sys.stdin.isatty() and os.getenv("MAX_SMS_USE_STDIN", "").strip().lower() in {
@@ -152,10 +187,14 @@ class WaitingSmsCodeProvider:
                         _clear_sms_code_file()
                     return code
 
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    raise SmsCodeTimeout("No SMS code received within 24 hours")
+
                 try:
                     queued = await asyncio.wait_for(
                         _sms_code_queue.get(),
-                        timeout=SMS_CODE_POLL_SECONDS,
+                        timeout=min(SMS_CODE_POLL_SECONDS, remaining),
                     )
                 except TimeoutError:
                     queued = None
@@ -345,9 +384,10 @@ async def authorize_max() -> None:
 
 
 async def ensure_max_session() -> None:
-    global _sms_retry, _password_user_id, _password_attempts
+    global _sms_retry, _sms_unanswered, _password_user_id, _password_attempts
 
     if is_max_authorized():
+        _clear_sms_request_marker()
         print(f"MAX session found: {max_session_path()}", flush=True)
         return
 
@@ -367,7 +407,15 @@ async def ensure_max_session() -> None:
 
     while not is_max_authorized():
         try:
+            if not _sms_retry:
+                await _wait_for_sms_request_window()
             await authorize_max()
+        except SmsCodeTimeout:
+            print("No SMS response for 24 hours; requesting a new code.", flush=True)
+            _sms_unanswered = True
+            _password_user_id = None
+            _prepare_for_sms_auth()
+            continue
         except ApiError as exc:
             if not _is_wrong_sms_code_error(exc):
                 raise
@@ -390,6 +438,7 @@ async def ensure_max_session() -> None:
 
     if _sms_request_notifier is not None:
         await _sms_request_notifier("success", MAX_PHONE)
+    _clear_sms_request_marker()
 
 
 async def main() -> None:

@@ -167,6 +167,13 @@ async def notify_sms_requested(kind: str, phone: str) -> None:
             "Пришлите свежий код сюда."
         )
         return
+    if kind == "unanswered":
+        await send_general_message(
+            "Ответ на предыдущий SMS-код не пришёл за сутки.\n"
+            f"На номер {_mask_phone(phone)} запрошен новый код.\n"
+            "Пришлите свежий код сюда."
+        )
+        return
     if kind == "success":
         await send_general_message("Сессия MAX восстановлена.")
         return

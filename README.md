@@ -68,6 +68,9 @@ can provide the password; if it came from the file, a group administrator can.
 
 Daily, the bot probes the MAX session. If the token is dead, it requests a
 new SMS and again waits for the code in General `/1`.
+If no code arrives, the bot requests a fresh SMS every 24 hours and posts a
+new notice in General. The request time is stored in `data/`, so a container
+restart does not trigger an extra SMS before the next daily request.
 
 Important:
 

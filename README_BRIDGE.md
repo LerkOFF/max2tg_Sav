@@ -19,6 +19,8 @@ python init_max.py
 
 If the session expires later, the running bot asks for a fresh SMS code in
 Telegram General topic `/1`. You can still pass a code via `data/.max_sms_code`.
+While no code arrives, the bot requests a new SMS every 24 hours; a persisted
+request timestamp prevents extra requests after container restarts.
 When MAX asks for a second-factor password, send it to the bot in a private
 Telegram chat. Only the person who sent the SMS code can provide it; when the
 code came from a file, a Telegram group administrator can provide it.

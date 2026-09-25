@@ -56,9 +56,15 @@ On the first start the container will:
 2. start Telegram polling
 3. connect to MAX; if the session is missing or expired, ask for an SMS code
    in the group's General topic (`/1`)
+4. if MAX requests a second-factor password, ask for it in a private chat
+   with the same Telegram bot
 
 Reply in General with only the digits, for example `123456`. The file
 `data/.max_sms_code` still works as a fallback.
+If the account has a password, open a private chat with the bot, press Start,
+and send the password there. The bot deletes the received password message
+after handing it to MAX. If the SMS code came from Telegram, only that sender
+can provide the password; if it came from the file, a group administrator can.
 
 Daily, the bot probes the MAX session. If the token is dead, it requests a
 new SMS and again waits for the code in General `/1`.

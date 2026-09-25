@@ -9,7 +9,7 @@ import time
 import aiosqlite
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.session.aiohttp import AiohttpSession
-from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError, TelegramRetryAfter
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramNetworkError, TelegramRetryAfter
 from aiogram.filters import Filter
 from aiogram.types import Message, FSInputFile, ReactionTypeEmoji
 from config import (
@@ -25,9 +25,12 @@ from max_audio import voice_temp_path
 from max_auth import (
     extract_sms_code,
     is_waiting_for_sms_code,
+    is_waiting_for_password,
+    password_recipient_id,
     remove_stale_max_session,
     set_sms_request_notifier,
     submit_sms_code,
+    submit_password,
 )
 from max_bridge import (
     MaxBridge,
@@ -166,6 +169,22 @@ async def notify_sms_requested(kind: str, phone: str) -> None:
         return
     if kind == "success":
         await send_general_message("Сессия MAX восстановлена.")
+        return
+    if kind in ("password", "password_retry"):
+        text = (
+            "Пароль MAX не подошёл. Попробуйте ещё раз.\n"
+            if kind == "password_retry" else
+            "SMS-код принят. На аккаунте MAX включён пароль.\n"
+        )
+        text += "Пришлите пароль в личный чат с этим ботом, не в группу."
+        recipient = password_recipient_id()
+        if recipient is not None:
+            try:
+                await bot.send_message(recipient, text)
+                return
+            except (TelegramBadRequest, TelegramForbiddenError):
+                pass
+        await send_general_message(text)
 
 
 def _pid_is_running(pid: int) -> bool:
@@ -2133,13 +2152,36 @@ async def ingest_general_sms_code(m: Message):
         m.message_thread_id,
         m.from_user.id if m.from_user else None,
     )
-    if not submit_sms_code(code):
+    if not submit_sms_code(code, m.from_user.id if m.from_user else None):
         logger.warning("SMS code received but auth waiter is gone")
         return
     try:
         await m.answer("Код принят, логинюсь в MAX...")
     except TelegramBadRequest:
         await send_general_message("Код принят, логинюсь в MAX...")
+
+
+@dp.message(F.chat.type == "private")
+async def ingest_max_password(m: Message):
+    if not is_waiting_for_password() or not m.text or not m.from_user:
+        return
+    if m.text.strip() == "/start":
+        await m.answer("Пришлите пароль от MAX сюда, в личный чат.")
+        return
+    recipient = password_recipient_id()
+    if recipient is None:
+        member = await bot.get_chat_member(TG_GROUP_ID, m.from_user.id)
+        if member.status not in ("administrator", "creator"):
+            return
+    elif m.from_user.id != recipient:
+        return
+    if not submit_password(m.text, m.from_user.id):
+        return
+    try:
+        await m.delete()
+    except (TelegramBadRequest, TelegramForbiddenError):
+        pass
+    await m.answer("Пароль получен, проверяю вход в MAX.")
 
 
 @dp.message(F.chat.id == TG_GROUP_ID)

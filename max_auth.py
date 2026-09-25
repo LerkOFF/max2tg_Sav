@@ -19,6 +19,10 @@ _sms_request_notifier: SmsRequestNotifier | None = None
 _sms_code_queue: asyncio.Queue[str] | None = None
 _waiting_for_sms = False
 _sms_retry = False
+_password_queue: asyncio.Queue[str] | None = None
+_waiting_for_password = False
+_password_user_id: int | None = None
+_password_attempts = 0
 
 
 def set_sms_request_notifier(notifier: SmsRequestNotifier | None) -> None:
@@ -30,6 +34,14 @@ def is_waiting_for_sms_code() -> bool:
     return _waiting_for_sms
 
 
+def is_waiting_for_password() -> bool:
+    return _waiting_for_password
+
+
+def password_recipient_id() -> int | None:
+    return _password_user_id
+
+
 def extract_sms_code(text: str | None) -> str | None:
     if not text:
         return None
@@ -39,13 +51,26 @@ def extract_sms_code(text: str | None) -> str | None:
     return None
 
 
-def submit_sms_code(code: str) -> bool:
+def submit_sms_code(code: str, user_id: int | None = None) -> bool:
+    global _password_user_id
     if _sms_code_queue is None:
         return False
     cleaned = (code or "").strip()
     if not cleaned:
         return False
+    _password_user_id = user_id
     _sms_code_queue.put_nowait(cleaned)
+    return True
+
+
+def submit_password(password: str, user_id: int) -> bool:
+    if _password_queue is None or not _waiting_for_password:
+        return False
+    if _password_user_id is not None and user_id != _password_user_id:
+        return False
+    if not password:
+        return False
+    _password_queue.put_nowait(password)
     return True
 
 
@@ -165,6 +190,25 @@ class WaitingSmsCodeProvider:
                 stdin_task.cancel()
 
 
+class WaitingPasswordProvider:
+    """Wait for the MAX 2FA password in a private Telegram chat."""
+
+    async def get_password(self, hint: str | None = None) -> str:
+        global _password_queue, _waiting_for_password, _password_attempts
+
+        _password_queue = asyncio.Queue()
+        _waiting_for_password = True
+        kind = "password_retry" if _password_attempts else "password"
+        _password_attempts += 1
+        try:
+            if _sms_request_notifier is not None:
+                await _sms_request_notifier(kind, hint or "")
+            return await _password_queue.get()
+        finally:
+            _waiting_for_password = False
+            _password_queue = None
+
+
 def max_session_path() -> Path:
     return MAX_SESSION_DIR / MAX_SESSION_NAME
 
@@ -270,6 +314,7 @@ async def authorize_max() -> None:
         work_dir=str(MAX_SESSION_DIR),
         extra_config=ExtraConfig(device_id=MAX_DEVICE_ID, reconnect=False),
         sms_code_provider=WaitingSmsCodeProvider(),
+        password_provider=WaitingPasswordProvider(),
     )
 
     auth_completed = False
@@ -298,7 +343,7 @@ async def authorize_max() -> None:
 
 
 async def ensure_max_session() -> None:
-    global _sms_retry
+    global _sms_retry, _password_user_id, _password_attempts
 
     if is_max_authorized():
         print(f"MAX session found: {max_session_path()}", flush=True)
@@ -312,6 +357,8 @@ async def ensure_max_session() -> None:
         remove_stale_max_session()
 
     print("MAX session not found. Starting authorization...", flush=True)
+    _password_user_id = None
+    _password_attempts = 0
     _prepare_for_sms_auth()
 
     from pymax.exceptions import ApiError
@@ -327,6 +374,8 @@ async def ensure_max_session() -> None:
                 flush=True,
             )
             _sms_retry = True
+            _password_user_id = None
+            _password_attempts = 0
             _prepare_for_sms_auth()
             continue
         except Exception:

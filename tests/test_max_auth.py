@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import shutil
 import sqlite3
 import tempfile
@@ -10,8 +11,10 @@ from unittest.mock import patch
 from max_auth import (
     _prepare_for_sms_auth,
     _resolve_fresh_sms_code,
+    WaitingPasswordProvider,
     is_max_session_usable,
     remove_stale_max_session,
+    submit_password,
 )
 
 
@@ -135,6 +138,31 @@ class TestMaxAuth(unittest.TestCase):
         self.assertTrue(is_stale_session_error(RuntimeError("Not connected to the server")))
         self.assertFalse(is_stale_session_error(RuntimeError("flood wait")))
         self.assertFalse(submit_sms_code("123456"))
+
+
+class TestPasswordAuth(unittest.IsolatedAsyncioTestCase):
+    async def test_password_is_requested_privately_and_only_sms_sender_can_submit(self) -> None:
+        notifications: list[tuple[str, str]] = []
+
+        async def notify(kind: str, hint: str) -> None:
+            notifications.append((kind, hint))
+
+        with patch("max_auth._password_user_id", 42), patch(
+            "max_auth._password_attempts", 0
+        ), patch("max_auth._sms_request_notifier", notify):
+            task = asyncio.create_task(WaitingPasswordProvider().get_password("hint"))
+            await asyncio.sleep(0)
+            self.assertEqual(notifications, [("password", "hint")])
+            self.assertFalse(submit_password("wrong sender", 43))
+            self.assertTrue(submit_password("secret", 42))
+            self.assertEqual(await task, "secret")
+            self.assertFalse(submit_password("too late", 42))
+
+            retry = asyncio.create_task(WaitingPasswordProvider().get_password())
+            await asyncio.sleep(0)
+            self.assertEqual(notifications[-1], ("password_retry", ""))
+            self.assertTrue(submit_password("corrected", 42))
+            self.assertEqual(await retry, "corrected")
 
 
 if __name__ == "__main__":

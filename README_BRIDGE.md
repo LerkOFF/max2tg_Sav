@@ -19,6 +19,9 @@ python init_max.py
 
 If the session expires later, the running bot asks for a fresh SMS code in
 Telegram General topic `/1`. You can still pass a code via `data/.max_sms_code`.
+When MAX asks for a second-factor password, send it to the bot in a private
+Telegram chat. Only the person who sent the SMS code can provide it; when the
+code came from a file, a Telegram group administrator can provide it.
 
 The script asks for the SMS code and then writes the session file. After that the
 bot can run non-interactively through `python main.py` or Docker Compose.

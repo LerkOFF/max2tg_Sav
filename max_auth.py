@@ -333,7 +333,9 @@ async def authorize_max() -> None:
             f"MAX auth complete. user_id={user_id}, session={max_session_path()}",
             flush=True,
         )
-        await c.stop()
+        # on_start runs inside pymax's startup task. Closing there makes the
+        # dispatcher wait for its own task and prevents the bridge from starting.
+        asyncio.create_task(c.stop())
 
     try:
         await client.start()

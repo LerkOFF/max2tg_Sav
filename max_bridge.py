@@ -144,6 +144,9 @@ def _camel_aliases(value: Any) -> Any:
 
 
 def _snake_to_camel(key: str) -> str:
+    # pymax dumps the attachment type under the "_type" alias; keep such keys as is.
+    if key.startswith("_"):
+        return key
     parts = key.split("_")
     if len(parts) == 1:
         return key
@@ -868,8 +871,15 @@ class MaxBridge:
                 url = file_data.get("url")
         if not url:
             raise RuntimeError("FILE attachment does not contain a download URL")
-        result = await self._download_url(url, kwargs, default_name=attach.get("name"))
-        result["name"] = attach.get("name") or Path(result["saved_path"]).name
+        name = attach.get("name")
+        # The local copy is only a temp file: keep it unique, the original name goes to Telegram.
+        local_name = (
+            f"max_{kwargs.get('chat_id')}_{kwargs.get('message_id')}_{kwargs.get('attach_index') or 0}_{name}"
+            if name
+            else None
+        )
+        result = await self._download_url(url, kwargs, default_name=local_name)
+        result["name"] = name or Path(result["saved_path"]).name
         return result
 
     async def download_sticker(self, **kwargs):

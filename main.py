@@ -916,6 +916,21 @@ def _append_video_fallback_note(html_caption: str, plain_caption: str) -> tuple[
     return html_caption, plain_caption
 
 
+def _append_file_fallback_note(
+    html_caption: str,
+    plain_caption: str,
+    file_name: object = None,
+) -> tuple[str, str]:
+    name = str(file_name).strip() if file_name else ""
+    label = f"Файл из Max не удалось скачать: {name}" if name else "Файл из Max не удалось скачать"
+    note_plain = f"📎 [{label}]"
+    note_html = f"📎 <i>[{html.escape(label)}]</i>"
+    if not html_caption:
+        return note_html, note_plain
+    plain_base = plain_caption or html_caption
+    return f"{html_caption}\n\n{note_html}", f"{plain_base}\n\n{note_plain}"
+
+
 async def _send_max_video_thumbnail_fallback(
     *,
     attach: dict,
@@ -1494,8 +1509,11 @@ async def _send_max_message_to_topic(chat_id: int, msg: dict, thread_id: int) ->
                     text_sent = True
                 except Exception:
                     logger.exception("Failed to download/send Max file chat_id=%s message_id=%s", chat_id, mid)
-                    html_fallback = caption or "📎 <i>[Файл из Max не удалось скачать]</i>"
-                    plain_fallback = plain_caption or "📎 [Файл из Max не удалось скачать]"
+                    html_fallback, plain_fallback = _append_file_fallback_note(
+                        caption,
+                        plain_caption,
+                        attach.get("name"),
+                    )
                     sent_messages.append(
                         await _send_tg_message_html_safe(
                             thread_id=thread_id,

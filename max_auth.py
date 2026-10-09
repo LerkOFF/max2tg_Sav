@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import sys
 import time
+import urllib.request
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
@@ -27,6 +29,41 @@ _password_queue: asyncio.Queue[str] | None = None
 _waiting_for_password = False
 _password_user_id: int | None = None
 _password_attempts = 0
+
+
+def _version_key(value: str) -> tuple[int, ...]:
+    parts: list[int] = []
+    for part in value.split("."):
+        parts.append(int(part) if part.isdigit() else 0)
+    return tuple(parts)
+
+
+def _newest_remote_app_version(catalog: object) -> str:
+    url = getattr(catalog, "DEFAULT_REMOTE_URL", "https://hashes.pymax.org/versions.json")
+    try:
+        request = urllib.request.Request(url, headers={"User-Agent": "pymax"})
+        with urllib.request.urlopen(request, timeout=10) as response:
+            data = json.loads(response.read().decode())
+    except Exception as exc:
+        print(f"MAX version catalog unavailable: {exc}", flush=True)
+        return ""
+    if not isinstance(data, dict) or not data:
+        return ""
+    return max((str(key) for key in data), key=_version_key)
+
+
+def max_client_version_kwargs() -> dict:
+    """Pin the newest published Max client fingerprint when pymax can load it."""
+    try:
+        from pymax.versions.catalog import VersionCatalog
+    except ImportError:
+        return {}
+    catalog = VersionCatalog(remote=True)
+    version = os.getenv("MAX_APP_VERSION", "").strip() or _newest_remote_app_version(catalog)
+    if not version:
+        return {"catalog": catalog}
+    print(f"MAX client version {version}", flush=True)
+    return {"app_version": version, "catalog": catalog}
 
 
 def set_sms_request_notifier(notifier: SmsRequestNotifier | None) -> None:
@@ -354,9 +391,11 @@ async def authorize_max() -> None:
         extra_config=ExtraConfig(device_id=MAX_DEVICE_ID, reconnect=False),
         sms_code_provider=WaitingSmsCodeProvider(),
         password_provider=WaitingPasswordProvider(),
+        **max_client_version_kwargs(),
     )
 
     auth_completed = False
+    done: asyncio.Event = asyncio.Event()
 
     @client.on_start()
     async def on_start(c):
@@ -372,15 +411,28 @@ async def authorize_max() -> None:
             f"MAX auth complete. user_id={user_id}, session={max_session_path()}",
             flush=True,
         )
-        # on_start runs inside pymax's startup task. Closing there makes the
-        # dispatcher wait for its own task and prevents the bridge from starting.
-        asyncio.create_task(c.stop())
+        # on_start runs inside pymax's startup task. stop() there deadlocks,
+        # and client.start() then waits forever on the closed connection.
+        done.set()
 
+    started = asyncio.create_task(client.start())
+    waiter = asyncio.create_task(done.wait())
     try:
-        await client.start()
-    except (asyncio.CancelledError, Exception):
-        if not auth_completed and not is_max_session_usable():
-            raise
+        finished, _pending = await asyncio.wait(
+            {started, waiter},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if started in finished and not auth_completed and not is_max_session_usable():
+            started.result()
+    finally:
+        waiter.cancel()
+        if not started.done():
+            started.cancel()
+        try:
+            await started
+        except (asyncio.CancelledError, Exception):
+            if not auth_completed and not is_max_session_usable():
+                raise
 
 
 async def ensure_max_session() -> None:

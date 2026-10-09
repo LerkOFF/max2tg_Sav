@@ -39,6 +39,7 @@ Required:
 Optional:
 
 - `MAX_DEVICE_ID=max2tg-bridge`
+- `MAX_APP_VERSION` — Android-клиент для входа. Пусто: берётся самая новая версия из каталога `hashes.pymax.org`
 - `MAX_SESSION_DIR=pymax`
 - `MAX_SESSION_NAME=session.db`
 - `GENERAL_TOPIC_ID=1` — Telegram forum General topic for SMS re-auth

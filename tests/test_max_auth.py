@@ -142,6 +142,12 @@ class TestMaxAuth(unittest.TestCase):
         self.assertFalse(is_stale_session_error(RuntimeError("flood wait")))
         self.assertFalse(submit_sms_code("123456"))
 
+    def test_newest_version_key_orders_numerically(self) -> None:
+        from max_auth import _version_key
+
+        versions = ["26.9.1", "26.25.0", "26.34.0", "26.33.1"]
+        self.assertEqual(max(versions, key=_version_key), "26.34.0")
+
 
 class TestPasswordAuth(unittest.IsolatedAsyncioTestCase):
     async def test_password_is_requested_privately_and_only_sms_sender_can_submit(self) -> None:

@@ -35,7 +35,7 @@ from max_audio import (
     voice_mime_type,
     voice_upload_name,
 )
-from max_auth import is_max_session_usable, is_stale_session_error
+from max_auth import is_max_session_usable, is_stale_session_error, max_client_version_kwargs
 
 
 logger = logging.getLogger(__name__)
@@ -94,8 +94,12 @@ def _dump_model(value: Any) -> Any:
     if hasattr(value, "model_dump"):
         try:
             data = value.model_dump(by_alias=True, mode="json")
-        except UnicodeDecodeError:
-            data = value.model_dump(by_alias=True, mode="python")
+        except (UnicodeDecodeError, TypeError):
+            try:
+                data = value.model_dump(by_alias=True, mode="python")
+            except TypeError:
+                fields = getattr(value, "model_fields", {}) or {}
+                data = {name: getattr(value, name) for name in fields}
         return _dump_model(data)
     return value
 
@@ -221,6 +225,7 @@ class MaxBridge:
             session_name=MAX_SESSION_NAME,
             work_dir=str(MAX_SESSION_DIR),
             extra_config=ExtraConfig(device_id=MAX_DEVICE_ID, reconnect=reconnect),
+            **max_client_version_kwargs(),
         )
 
     def load_sdk(self) -> bool:

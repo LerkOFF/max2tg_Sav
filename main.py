@@ -116,6 +116,10 @@ STARTUP_BACKFILL_ENABLED = os.getenv("STARTUP_BACKFILL_ENABLED", "true").strip()
 STARTUP_BACKFILL_CHATS_LIMIT = int(os.getenv("STARTUP_BACKFILL_CHATS_LIMIT", "10"))
 STARTUP_BACKFILL_MESSAGES_PER_CHAT = int(os.getenv("STARTUP_BACKFILL_MESSAGES_PER_CHAT", "10"))
 MAX_STATE_SYNC_MESSAGES_PER_CHAT = int(os.getenv("MAX_STATE_SYNC_MESSAGES_PER_CHAT", "20"))
+# Разовый добор пропущенного после долгого простоя: unix-время, раньше которого записаны уже пересланные
+# сообщения. В каждом чате берутся сообщения новее последнего записанного до этого момента.
+BACKFILL_GAP_CUTOFF_TS = int(os.getenv("BACKFILL_GAP_CUTOFF_TS", "0"))
+BACKFILL_GAP_MAX_PER_CHAT = int(os.getenv("BACKFILL_GAP_MAX_PER_CHAT", "300"))
 MAX_STATE_SYNC_INTERVAL_SECONDS = int(os.getenv("MAX_STATE_SYNC_INTERVAL_SECONDS", "300"))
 MAX_STARTUP_RETRY_SECONDS = int(os.getenv("MAX_STARTUP_RETRY_SECONDS", "30"))
 MAX_READY_TIMEOUT_SECONDS = float(os.getenv("MAX_READY_TIMEOUT_SECONDS", "90"))
@@ -1658,7 +1662,12 @@ async def _upsert_max_message_in_topic(chat_id: int, msg: dict, thread_id: int) 
     await _sync_max_message_state_to_tg(chat_id, mid, msg, msg.get("reactionInfo"), clear_when_empty=True)
 
 
-async def replay_recent_messages_to_topic(chat_id: int, thread_id: int, count: int = BACKFILL_MESSAGES_PER_CHAT) -> None:
+async def replay_recent_messages_to_topic(
+    chat_id: int,
+    thread_id: int,
+    count: int = BACKFILL_MESSAGES_PER_CHAT,
+    min_message_id: int = 0,
+) -> None:
     try:
         last_message = await max_bridge.get_last_message(chat_id)
     except Exception as exc:
@@ -1689,9 +1698,13 @@ async def replay_recent_messages_to_topic(chat_id: int, thread_id: int, count: i
             break
         next_cursor = cursor
         added = 0
+        reached_floor = False
         for msg in page_messages:
             message_id = int(msg.get("id") or 0)
             if not message_id or message_id in seen_ids:
+                continue
+            if min_message_id and message_id <= min_message_id:
+                reached_floor = True
                 continue
             seen_ids.add(message_id)
             messages.append(msg)
@@ -1701,6 +1714,8 @@ async def replay_recent_messages_to_topic(chat_id: int, thread_id: int, count: i
             remaining -= added
             if remaining <= 0:
                 break
+        if reached_floor:
+            break
         if not added or next_cursor == cursor or len(page_messages) < page_size:
             break
         cursor = next_cursor
@@ -1838,14 +1853,26 @@ async def backfill_existing_topics(
     *,
     count: int = STARTUP_BACKFILL_MESSAGES_PER_CHAT,
     chats_limit: int = STARTUP_BACKFILL_CHATS_LIMIT,
+    gap_cutoff_ts: int = BACKFILL_GAP_CUTOFF_TS,
+    gap_max_per_chat: int = BACKFILL_GAP_MAX_PER_CHAT,
 ) -> None:
+    gap_floors: dict[int, int] = {}
     async with aiosqlite.connect(db.db_path) as conn:
         async with conn.execute(
             "SELECT max_chat_id, tg_thread_id, COALESCE(chat_name, '') FROM chat_mapping ORDER BY chat_name, max_chat_id"
         ) as cursor:
             rows = await cursor.fetchall()
+        if gap_cutoff_ts > 0:
+            async with conn.execute(
+                "SELECT max_chat_id, MAX(max_message_id) FROM message_mapping WHERE created_at < ? GROUP BY max_chat_id",
+                (gap_cutoff_ts,),
+            ) as cursor:
+                gap_floors = {int(chat): int(mid) for chat, mid in await cursor.fetchall()}
     if not rows:
         return
+
+    if gap_cutoff_ts > 0 and gap_max_per_chat > 0:
+        chats_limit = len(rows)
 
     if count <= 0 or chats_limit <= 0:
         logger.info("Startup message backfill skipped (count=%s chats_limit=%s)", count, chats_limit)
@@ -1872,7 +1899,16 @@ async def backfill_existing_topics(
     )
     for chat_id, thread_id, chat_name in selected_rows:
         try:
-            await replay_recent_messages_to_topic(int(chat_id), int(thread_id), count=count)
+            floor = gap_floors.get(int(chat_id), 0)
+            if gap_cutoff_ts > 0 and gap_max_per_chat > 0 and floor:
+                await replay_recent_messages_to_topic(
+                    int(chat_id),
+                    int(thread_id),
+                    count=gap_max_per_chat,
+                    min_message_id=floor,
+                )
+            else:
+                await replay_recent_messages_to_topic(int(chat_id), int(thread_id), count=count)
         except Exception as exc:
             logger.exception(
                 "Startup backfill failed for Max chat_id=%s topic=%s (%s): %s",

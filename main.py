@@ -120,6 +120,8 @@ MAX_STATE_SYNC_MESSAGES_PER_CHAT = int(os.getenv("MAX_STATE_SYNC_MESSAGES_PER_CH
 # сообщения. В каждом чате берутся сообщения новее последнего записанного до этого момента.
 BACKFILL_GAP_CUTOFF_TS = int(os.getenv("BACKFILL_GAP_CUTOFF_TS", "0"))
 BACKFILL_GAP_MAX_PER_CHAT = int(os.getenv("BACKFILL_GAP_MAX_PER_CHAT", "300"))
+# Для чатов, где раньше ничего не пересылалось: брать сообщения не старше этого времени (миллисекунды unix).
+BACKFILL_GAP_MIN_TIME_MS = int(os.getenv("BACKFILL_GAP_MIN_TIME_MS", "0"))
 MAX_STATE_SYNC_INTERVAL_SECONDS = int(os.getenv("MAX_STATE_SYNC_INTERVAL_SECONDS", "300"))
 MAX_STARTUP_RETRY_SECONDS = int(os.getenv("MAX_STARTUP_RETRY_SECONDS", "30"))
 MAX_READY_TIMEOUT_SECONDS = float(os.getenv("MAX_READY_TIMEOUT_SECONDS", "90"))
@@ -1673,6 +1675,7 @@ async def replay_recent_messages_to_topic(
     thread_id: int,
     count: int = BACKFILL_MESSAGES_PER_CHAT,
     min_message_id: int = 0,
+    min_time_ms: int = 0,
 ) -> None:
     try:
         last_message = await max_bridge.get_last_message(chat_id)
@@ -1710,6 +1713,9 @@ async def replay_recent_messages_to_topic(
             if not message_id or message_id in seen_ids:
                 continue
             if min_message_id and message_id <= min_message_id:
+                reached_floor = True
+                continue
+            if min_time_ms and int(msg.get("time") or 0) < min_time_ms:
                 reached_floor = True
                 continue
             seen_ids.add(message_id)
@@ -1861,6 +1867,7 @@ async def backfill_existing_topics(
     chats_limit: int = STARTUP_BACKFILL_CHATS_LIMIT,
     gap_cutoff_ts: int = BACKFILL_GAP_CUTOFF_TS,
     gap_max_per_chat: int = BACKFILL_GAP_MAX_PER_CHAT,
+    gap_min_time_ms: int = BACKFILL_GAP_MIN_TIME_MS,
 ) -> None:
     gap_floors: dict[int, int] = {}
     async with aiosqlite.connect(db.db_path) as conn:
@@ -1912,6 +1919,13 @@ async def backfill_existing_topics(
                     int(thread_id),
                     count=gap_max_per_chat,
                     min_message_id=floor,
+                )
+            elif gap_cutoff_ts > 0 and gap_max_per_chat > 0 and gap_min_time_ms > 0:
+                await replay_recent_messages_to_topic(
+                    int(chat_id),
+                    int(thread_id),
+                    count=gap_max_per_chat,
+                    min_time_ms=gap_min_time_ms,
                 )
             else:
                 await replay_recent_messages_to_topic(int(chat_id), int(thread_id), count=count)

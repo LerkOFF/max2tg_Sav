@@ -15,6 +15,7 @@ from config import MAX_DEVICE_ID, MAX_PHONE, MAX_SESSION_DIR, MAX_SESSION_NAME
 SMS_CODE_FILE = Path(os.getenv("MAX_SMS_CODE_FILE", "data/.max_sms_code"))
 SMS_CODE_POLL_SECONDS = float(os.getenv("MAX_SMS_CODE_POLL_SECONDS", "3"))
 SMS_REQUEST_MARKER_FILE = Path("data/.max_sms_requested_at")
+PASSWORD_FILE = Path(os.getenv("MAX_PASSWORD_FILE", "data/.max_password"))
 SMS_CODE_RENEW_SECONDS = 24 * 60 * 60
 SMS_CODE_RE = re.compile(r"^\d{4,8}$")
 
@@ -291,10 +292,28 @@ class WaitingPasswordProvider:
         try:
             if _sms_request_notifier is not None:
                 await _sms_request_notifier(kind, hint or "")
-            return await _password_queue.get()
+            while True:
+                file_password = _read_password_file()
+                if file_password:
+                    print("Using MAX password from file", flush=True)
+                    return file_password
+                try:
+                    return await asyncio.wait_for(_password_queue.get(), timeout=SMS_CODE_POLL_SECONDS)
+                except asyncio.TimeoutError:
+                    continue
         finally:
             _waiting_for_password = False
             _password_queue = None
+
+
+def _read_password_file() -> str | None:
+    """One-shot password from a file: read once and delete, so it does not stay on disk."""
+    try:
+        text = PASSWORD_FILE.read_text(encoding="utf-8").strip("\r\n")
+    except OSError:
+        return None
+    PASSWORD_FILE.unlink(missing_ok=True)
+    return text or None
 
 
 def max_session_path() -> Path:

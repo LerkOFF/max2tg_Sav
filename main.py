@@ -183,7 +183,7 @@ async def notify_sms_requested(kind: str, phone: str) -> None:
             if kind == "password_retry" else
             "SMS-код принят. На аккаунте MAX включён пароль.\n"
         )
-        text += "Пришлите пароль в личный чат с этим ботом, не в группу."
+        text += "Пришлите пароль сюда в группу (сообщение будет сразу удалено) или в личный чат с этим ботом."
         recipient = password_recipient_id()
         if recipient is not None:
             try:
@@ -2221,6 +2221,45 @@ async def ingest_general_sms_code(m: Message):
         await m.answer("Код принят, логинюсь в MAX...")
     except TelegramBadRequest:
         await send_general_message("Код принят, логинюсь в MAX...")
+
+
+class PendingGroupPasswordFilter(Filter):
+    """Пароль MAX из группы: только от админа (в том числе анонимного), только в General."""
+
+    async def __call__(self, message: Message) -> bool:
+        if message.chat.id != TG_GROUP_ID or not message.text:
+            return False
+        if not is_waiting_for_password():
+            return False
+        if message.message_thread_id not in (None, GENERAL_TOPIC_ID):
+            return False
+        if message.text.strip().startswith("/"):
+            return False
+        if _is_group_anonymous_admin(message):
+            return True
+        if message.from_user is None or message.from_user.is_bot:
+            return False
+        recipient = password_recipient_id()
+        if recipient is not None and message.from_user.id != recipient:
+            return False
+        try:
+            member = await bot.get_chat_member(TG_GROUP_ID, message.from_user.id)
+        except (TelegramBadRequest, TelegramForbiddenError):
+            return False
+        return member.status in ("administrator", "creator")
+
+
+@dp.message(PendingGroupPasswordFilter())
+async def ingest_group_max_password(m: Message):
+    sender_id = m.from_user.id if m.from_user else 0
+    accepted = submit_password(m.text, sender_id)
+    try:
+        await m.delete()
+    except (TelegramBadRequest, TelegramForbiddenError):
+        pass
+    logger.info("MAX password from group chat accepted=%s (message deleted)", accepted)
+    if accepted:
+        await send_general_message("Пароль получен, проверяю вход в MAX.")
 
 
 @dp.message(F.chat.type == "private")

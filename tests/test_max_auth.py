@@ -135,6 +135,18 @@ class TestMaxAuth(unittest.TestCase):
         self.assertIsNone(extract_sms_code(""))
         self.assertIsNone(extract_sms_code(None))
 
+    def test_code_without_known_sender_leaves_password_open_for_admins(self) -> None:
+        import max_auth
+
+        async def run() -> None:
+            max_auth._sms_code_queue = asyncio.Queue()
+            max_auth._password_user_id = 111
+            self.assertTrue(max_auth.submit_sms_code("123456", None))
+            self.assertIsNone(max_auth.password_recipient_id())
+            max_auth._sms_code_queue = None
+
+        asyncio.run(run())
+
     def test_stale_session_error_detects_login_token(self) -> None:
         from max_auth import is_stale_session_error, submit_sms_code
 

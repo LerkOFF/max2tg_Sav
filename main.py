@@ -2210,7 +2210,11 @@ async def ingest_general_sms_code(m: Message):
         m.message_thread_id,
         m.from_user.id if m.from_user else None,
     )
-    if not submit_sms_code(code, m.from_user.id if m.from_user else None):
+    sender_id = m.from_user.id if m.from_user else None
+    if _is_group_anonymous_admin(m) or (m.from_user and m.from_user.is_bot):
+        # Админ пишет анонимно: настоящий id неизвестен, пароль примет любой админ группы.
+        sender_id = None
+    if not submit_sms_code(code, sender_id):
         logger.warning("SMS code received but auth waiter is gone")
         return
     try:

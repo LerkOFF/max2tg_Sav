@@ -127,7 +127,11 @@ class TestMaxAuth(unittest.TestCase):
 
         self.assertEqual(extract_sms_code("504310"), "504310")
         self.assertEqual(extract_sms_code(" 504 310 "), "504310")
-        self.assertIsNone(extract_sms_code("код 504310"))
+        self.assertEqual(extract_sms_code("код 504310"), "504310")
+        self.assertEqual(extract_sms_code("Код: 504 310"), "504310")
+        self.assertEqual(extract_sms_code("SMS-код 504310"), None)
+        self.assertIsNone(extract_sms_code("в 2024 году"))
+        self.assertIsNone(extract_sms_code("код придёт позже 504310"))
         self.assertIsNone(extract_sms_code(""))
         self.assertIsNone(extract_sms_code(None))
 

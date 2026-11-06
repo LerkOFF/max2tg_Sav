@@ -157,7 +157,7 @@ async def notify_sms_requested(kind: str, phone: str) -> None:
         await send_general_message(
             "Сессия MAX истекла или нужна авторизация.\n"
             f"На номер {_mask_phone(phone)} отправлен SMS-код.\n"
-            "Пришлите код сюда, в General (/1)."
+            "Пришлите код сюда, в General (/1), или личным сообщением боту. Можно просто цифры или «код 123456»."
         )
         return
     if kind == "expired":
@@ -2154,17 +2154,49 @@ def _extract_tg_edit_text(message: Message) -> str | None:
         return message.caption
     return None
 
+def _is_group_anonymous_admin(message: Message) -> bool:
+    sender_chat = getattr(message, "sender_chat", None)
+    return bool(sender_chat and sender_chat.id == TG_GROUP_ID)
+
+
+async def _is_group_member(user_id: int) -> bool:
+    try:
+        member = await bot.get_chat_member(TG_GROUP_ID, user_id)
+    except (TelegramBadRequest, TelegramForbiddenError):
+        return False
+    return member.status in ("creator", "administrator", "member", "restricted")
+
+
 class PendingSmsCodeFilter(Filter):
     async def __call__(self, message: Message) -> bool:
-        if message.chat.id != TG_GROUP_ID:
-            return False
-        if message.from_user and message.from_user.is_bot:
-            return False
         if not is_waiting_for_sms_code():
             return False
-        if message.message_thread_id not in (None, GENERAL_TOPIC_ID):
+        is_group = message.chat.id == TG_GROUP_ID
+        is_private = message.chat.type == "private"
+        if not is_group and not is_private:
             return False
-        return extract_sms_code(message.text) is not None
+        anonymous_admin = is_group and _is_group_anonymous_admin(message)
+        if message.from_user and message.from_user.is_bot and not anonymous_admin:
+            return False
+        if is_group and message.message_thread_id not in (None, GENERAL_TOPIC_ID):
+            return False
+        code = extract_sms_code(message.text)
+        if code is None:
+            logger.info(
+                "While waiting for SMS: ignored message chat=%s type=%s thread=%s user=%s length=%s (not a code)",
+                message.chat.id,
+                message.chat.type,
+                message.message_thread_id,
+                message.from_user.id if message.from_user else None,
+                len(message.text or ""),
+            )
+            return False
+        if is_private:
+            user_id = message.from_user.id if message.from_user else None
+            if user_id is None or not await _is_group_member(user_id):
+                logger.info("While waiting for SMS: code in private chat from non-member user=%s ignored", user_id)
+                return False
+        return True
 
 
 @dp.message(PendingSmsCodeFilter())
@@ -2173,7 +2205,8 @@ async def ingest_general_sms_code(m: Message):
     if not code:
         return
     logger.info(
-        "SMS code received from Telegram thread=%s user=%s",
+        "SMS code received from Telegram chat=%s thread=%s user=%s",
+        m.chat.type,
         m.message_thread_id,
         m.from_user.id if m.from_user else None,
     )

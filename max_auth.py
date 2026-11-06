@@ -83,12 +83,24 @@ def password_recipient_id() -> int | None:
     return _password_user_id
 
 
+SMS_CODE_WITH_WORD_RE = re.compile(
+    r"^(?:код|code|смс|sms)(?:\s+(?:из\s+)?(?:смс|sms))?\s*[:\-=]?\s*(\d(?:[\s\-]?\d){3,7})$",
+    re.IGNORECASE,
+)
+
+
 def extract_sms_code(text: str | None) -> str | None:
     if not text:
         return None
-    code = re.sub(r"\s+", "", text.strip())
+    stripped = text.strip()
+    code = re.sub(r"\s+", "", stripped)
     if SMS_CODE_RE.fullmatch(code):
         return code
+    match = SMS_CODE_WITH_WORD_RE.fullmatch(stripped)
+    if match:
+        digits = re.sub(r"\D", "", match.group(1))
+        if SMS_CODE_RE.fullmatch(digits):
+            return digits
     return None
 
 

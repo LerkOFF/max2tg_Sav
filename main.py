@@ -623,6 +623,12 @@ async def _create_forum_topic_with_retry(title: str):
             await asyncio.sleep(delay)
 
 
+def _is_tg_entity_parse_error(exc: BaseException) -> bool:
+    """Telegram отказал в разборе HTML-разметки: сообщение можно отправить простым текстом."""
+    text = str(exc).lower()
+    return "can't parse entities" in text or "can't find end of the entity" in text or "unsupported start tag" in text
+
+
 async def _send_tg_message_html_safe(*, thread_id: int, html_text: str, plain_text: str) -> Message:
     try:
         return await _run_tg_send_with_retry(
